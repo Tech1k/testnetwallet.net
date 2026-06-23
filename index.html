@@ -171,7 +171,7 @@
     border-bottom:2px solid transparent; margin-bottom:-1px; white-space:nowrap}
   .tab:hover{color:var(--text)}
   .tab.active{color:var(--accent); border-bottom-color:var(--accent)}
-  .copy{cursor:pointer; color:var(--accent); font-size:12px; font-weight:600; user-select:none; white-space:nowrap}
+  .copy{cursor:pointer; color:var(--accent); font-size:13px; font-weight:600; user-select:none; white-space:nowrap; display:inline-flex; align-items:center; padding:6px 8px; margin:-6px -2px}
   .stack{display:flex; flex-direction:column; gap:var(--s1)}
   .between{display:flex; align-items:center; justify-content:space-between; gap:var(--s3); flex-wrap:wrap}
 
@@ -208,13 +208,15 @@
   @keyframes pslide{0%{transform:translateX(-110%)} 100%{transform:translateX(275%)}}
 
   @media (max-width:600px){
-    .seed-grid{grid-template-columns:repeat(2,1fr)} .balance{font-size:2em}
+    .seed-grid{grid-template-columns:repeat(2,1fr)}
+    .balance{font-size:clamp(1.5em,8vw,2em); word-break:normal; overflow-wrap:anywhere; line-height:1.15}
     main{padding:0 var(--s3)} .nav-inner{padding:var(--s3) var(--s3); gap:var(--s3)}
     .card{margin:var(--s3) 0} .card-b{padding:var(--s3)} .card-h{padding:var(--s3)}
     .nav-links{gap:var(--s3)} .foot-inner{gap:var(--s3); padding:var(--s4) var(--s3)}
+    .nav-links a, .foot-inner a{padding:8px 4px; display:inline-flex; align-items:center}
     .hero-actions{gap:var(--s2)}
-    .btn{min-height:44px} .btn.sm{min-height:40px} .theme-toggle{width:40px; height:40px}
-    input[type=text],input[type=password],input[type=number],select{min-height:44px}
+    .btn{min-height:44px} .btn.sm{min-height:44px} .pill{min-height:44px} .theme-toggle{width:44px; height:44px}
+    input[type=text],input[type=password],input[type=number],textarea,select{min-height:44px; font-size:16px}
   }
 
   /* ---- Animations (functional feedback; all disabled under prefers-reduced-motion below) ---- */

@@ -790,11 +790,13 @@ function render(){
   const lb = $('lock-toggle'); if(lb) lb.style.display = (isEncrypted() && !isLocked()) ? 'inline-flex' : 'none';
   if(isLocked()){ clear(view).append((_softLocked && _cryptoKey) ? renderPinScreen() : renderLockScreen()); a11yify(); return; }
   if(!state.wallet){ clear(view).append(renderOnboarding()); return; }
+  const y = window.scrollY;                              // rebuilding #view collapses its height, clamping scroll to the top; restore it so a tab/pill click or a background refresh doesn't yank the page up
   const parts = [renderControls(), renderBalance()];
   if(state.addresses.length) parts.push(renderTabs(), renderPanel());
   else parts.push(el('div',{class:'card'}, el('div',{class:'card-b'}, el('p',{class:'bad'}, state.error || 'No addresses available.'))));
   clear(view).append(...parts);
   a11yify();
+  if(window.scrollY !== y) window.scrollTo(0, y);
 }
 // Make the div-based pills/tabs/copy links keyboard-operable (role + tabindex; Enter/Space handled globally below).
 function a11yify(){
@@ -879,13 +881,13 @@ function renderControls(){
       el('div',{class:'between'}, el('span',{class:'sub'},'Coin'), coinPills),
       el('div',{class:'between'}, el('span',{class:'sub',title:xmrMode?'Stagenet and testnet are two independent Monero test networks.':'Different address formats from the same recovery phrase. Hover each for details.'}, xmrMode?'Network':(electrum?'Wallet type':'Address type')),
         xmrMode?netPills:(electrum ? el('span',{class:'sub'}, ELECTRUM_SCHEMES[state.scheme].label) : typePills)),
-      electrum ? el('div',{class:'sub faint',style:'margin-top:-2px;font-size:12px'},'Imported from an Electrum seed. The address type and derivation are fixed to match Electrum.') : null,
-      (xmrMode||electrum) ? null : el('div',{class:'sub faint',style:'margin-top:2px;font-size:12px'},'Different formats from your one recovery phrase. SegWit (tb1q…) is the default; Taproot (tb1p…) is newest.'),
+      electrum ? el('div',{class:'sub faint',style:'margin-top:-2px'},'Imported from an Electrum seed. The address type and derivation are fixed to match Electrum.') : null,
+      (xmrMode||electrum) ? null : el('div',{class:'sub faint',style:'margin-top:2px'},'Different formats from your one recovery phrase. SegWit (tb1q…) is the default; Taproot (tb1p…) is newest.'),
       (xmrMode||electrum) ? null : el('div',{class:'between'},
         el('span',{class:'sub',title:'BIP-44 account index (advanced): a separate, independent set of addresses derived from the same recovery phrase. Leave at 0 unless you want to keep funds in distinct accounts.'},'Account index'),
         el('input',{type:'number',min:'0',value:state.account,style:'max-width:80px','aria-label':'BIP account index',title:'Advanced: BIP account index. Leave at 0 unless you want a separate set of addresses.',
           onchange:e=>{ const a=Math.max(0,parseInt(e.target.value)||0); if(a===state.account){ render(); return; } state.account=a; saveSettings(); buildAddresses(); render(); refresh(); }})),
-      (xmrMode||electrum) ? null : el('div',{class:'sub faint',style:'margin-top:-2px;font-size:12px'},'A separate set of addresses under the same recovery phrase. Most people leave this at 0.'),
+      (xmrMode||electrum) ? null : el('div',{class:'sub faint',style:'margin-top:-2px'},'A separate set of addresses under the same recovery phrase. Most people leave this at 0.'),
     ));
 }
 
@@ -1477,7 +1479,7 @@ function renderMoneroTools(){
           body.append(el('tr',{},
             el('td',{class:'amt'}, fmtXmr(o.amount)),
             el('td',{class:(o.frozen?'warn':o.locked?'muted':'ok')}, status),
-            el('td',{class:'mono faint',style:'font-size:11px'}, o.keyImage ? (o.keyImage.slice(0,10)+'…') : '-'),
+            el('td',{class:'mono faint',style:'font-size:12px'}, o.keyImage ? (o.keyImage.slice(0,10)+'…') : '-'),
             el('td',{}, o.keyImage ? toggle : null)));
         }
         tbl.append(body);
@@ -2412,7 +2414,7 @@ function renderSend(){
     feePills.append(p);
   }
   const feePresets = el('div',{class:'stack',style:'gap:4px'}, feePills,
-    el('div',{class:'sub faint',style:'font-size:12px'},'Slow ≈ 1 hr · Medium ≈ 30 min · Fast ≈ next blocks. Higher sat/vB confirms sooner.'));
+    el('div',{class:'sub faint'},'Slow ≈ 1 hr · Medium ≈ 30 min · Fast ≈ next blocks. Higher sat/vB confirms sooner.'));
 
   const advToggle = el('label',{class:'fld',style:'display:flex;gap:8px;align-items:center;cursor:pointer'},
     el('input',{type:'checkbox',checked:s.advanced,onchange:e=>{ s.advanced=e.target.checked; render(); }}), 'Coin control: choose which coins may be spent');
