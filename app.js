@@ -342,8 +342,13 @@ function renderFaucet(address){
     btn.disabled = true; btn.textContent = 'Requesting…'; clear(out);
     try {
       const j = await faucetClaim(slug, address);
-      clear(out).append(el('div',{class:'msg ok'}, '✓ ' + (j.amount ? (j.amount + ' ') : '') + 'sent' + (j.txid ? (' · txid ' + String(j.txid).slice(0,14) + '…') : '') + ' - it’ll appear here shortly.'));
-      setTimeout(()=>{ if(state.wallet && !isLocked()) refresh(); }, 4000);
+      const fc = COINS[state.coin];
+      const okMsg = el('div',{class:'msg ok'}, '✓ ' + (j.amount ? (j.amount + ' ' + fc.ticker + ' ') : '') + 'sent from the faucet. It will appear in your balance shortly.');
+      if(j.txid) okMsg.append(el('div',{class:'sub',style:'margin-top:4px'}, 'Transaction: ',
+        el('a',{class:'addr',href:fc.explorer + '/tx/' + encodeURIComponent(j.txid),target:'_blank',rel:'noopener'}, String(j.txid).slice(0,24) + '…')));
+      clear(out).append(okMsg);
+      // the faucet tx takes a few seconds to broadcast and get indexed; poll a few times so the balance updates without a manual refresh
+      [3000, 9000, 20000, 40000].forEach(ms => setTimeout(()=>{ if(state.wallet && !isLocked()) refresh(); }, ms));
     } catch(e){
       const rate = e.code === 'rate_limited' || e.code === 'ip_rate_limited' || e.code === 'daily_cap';
       clear(out).append(el('div',{class:'msg ' + (rate ? 'warn' : 'bad')},
@@ -705,6 +710,15 @@ async function discoverAddresses(ck){
     : `m/${TYPES[type].purpose}'/1'/${account}'/0/${i}`;
   const WIN = 10;
   let start = 0, highestUsed = -1, consecUnused = 0;
+  // Write the extended count for the CAPTURED context (the token guards against a wallet switch, since
+  // openWallet→refresh bumps it) and repaint, but only if the user is still viewing this exact context.
+  // Called incrementally so an imported wallet's balance shows as soon as funds are found, not after the
+  // whole gap scan completes.
+  const commit = () => {
+    if(tok !== _discoverTok || highestUsed + 1 <= curCount()) return;
+    store.counts = store.counts || {}; store.counts[wid] = store.counts[wid] || {}; store.counts[wid][cKey] = highestUsed + 1; saveStore();
+    if(state.wallet && state.wallet.id===wid && state.coin===coin && state.addrType===type && state.account===account){ buildAddresses(); render(); refresh(); }
+  };
   while(start < 250 && consecUnused < GAP_LIMIT){
     let addrs;
     try { addrs = Array.from({length:WIN}, (_,k)=> addrFromPub(master.derive(pathAt(start+k)).publicKey, coin, type)); }
@@ -712,15 +726,12 @@ async function discoverAddresses(ck){
     const used = await Promise.all(addrs.map(a => apiGet(coin, '/address/'+encodeURIComponent(a))
       .then(s => (((s.chain_stats&&s.chain_stats.tx_count)||0) + ((s.mempool_stats&&s.mempool_stats.tx_count)||0)) > 0).catch(()=>false)));
     if(tok !== _discoverTok){ _discovered.delete(ck); return; }   // superseded by a newer scan - retry later
+    const prevHighest = highestUsed;
     for(let k=0;k<WIN;k++){ if(used[k]){ highestUsed = Math.max(highestUsed, start+k); consecUnused = 0; } else consecUnused++; }
+    if(highestUsed > prevHighest) commit();                // repaint the moment new used addresses appear
     start += WIN;
   }
-  // Clean completion: write the extended count for the CAPTURED context (the token guards against a wallet
-  // switch, since openWallet→refresh bumps it). Only repaint if the user is still viewing this exact context.
-  if(tok === _discoverTok && highestUsed + 1 > curCount()){
-    store.counts = store.counts || {}; store.counts[wid] = store.counts[wid] || {}; store.counts[wid][cKey] = highestUsed + 1; saveStore();
-    if(state.wallet && state.wallet.id===wid && state.coin===coin && state.addrType===type && state.account===account){ buildAddresses(); render(); refresh(); }
-  }
+  commit();                                                // final pass (covers the last extension)
 }
 
 /* ----------------------------- data refresh (race-guarded) ----------------------------- */
