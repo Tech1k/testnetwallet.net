@@ -1,0 +1,14 @@
+# Cloudflare Pages redirect rules. The deploy output is the repo root, so every committed file is otherwise
+# served publicly. These paths are dev/build tooling and in-progress MWEB code that the live wallet never loads;
+# redirect them to the app so they are not served from the production origin. (Pages _redirects has no 404
+# status - only 301/302/303/307/308 - and a redirect is always followed even when the file exists, so a
+# 302-to-root is the supported way to stop serving a committed file.)
+#
+# Kept intentionally public: tests.html / tests.js (a CSP-clean in-browser crypto self-verification
+# page) and the vendored runtime deps.
+
+/tools/*                    /  302
+/mweb.mjs                   /  302
+/mweb-test.html             /  302
+/mweb-test.js               /  302
+/vendor/noble-sha512.mjs    /  302

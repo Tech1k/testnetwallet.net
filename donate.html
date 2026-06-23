@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later | TestnetWallet © 2026 Tech1k -->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#5271ff">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<!-- Donation page makes no network requests; QR codes are generated locally. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<title>Donate - TestnetWallet</title>
+<meta name="description" content="Support TestnetWallet, a free and open-source testnet HD wallet. Voluntary mainnet donations help cover the domain, nodes and infrastructure.">
+<link rel="canonical" href="https://testnetwallet.net/donate">
+<style>
+  :root{
+    --bg:#14161b; --card:#1c1f27; --surface:#232730; --border:#2a2e37;
+    --text:#e6e8ec; --muted:#9aa0ab; --faint:#8b919b;
+    --accent:#6b86ff; --accent-soft:#9db2ff; --accent-bg:#1b2236; --accent-dim:#2e3a5c;
+    --btn:#6b86ff; --on-accent:#ffffff; --ok:#4fbf75; --warn:#e0894f;
+    --nav-bg:rgba(20,22,27,.86);
+    --r:16px; --r-sm:9px; --pill:999px;
+    --font:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,'SF Mono','JetBrains Mono','DejaVu Sans Mono',Menlo,Consolas,monospace;
+  }
+  html[data-theme="light"]{
+    --bg:#f7f7f7; --card:#ffffff; --surface:#f4f5f7; --border:#e5e5e5;
+    --text:#1b1d23; --muted:#6b6b6b; --faint:#8b919b;
+    --accent:#5271ff; --accent-soft:#2f49c9; --accent-bg:#eef1ff; --accent-dim:#d7ddff;
+    --btn:#3f57e0; --nav-bg:rgba(255,255,255,.85);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{font-family:var(--font); background:var(--bg); color:var(--text); line-height:1.5; -webkit-font-smoothing:antialiased}
+  a{color:var(--accent); text-decoration:none}
+  a:hover{text-decoration:underline}
+  .ext::after{content:"↗"; font-size:.72em; opacity:.5; margin-left:2px; vertical-align:1px; text-decoration:none; display:inline-block}
+  code,.mono,.addr{font-family:var(--mono)}
+  h1,h2,h3{margin:0 0 .4em}
+  button{font-family:inherit}
+
+  nav{position:sticky; top:0; z-index:30; background:var(--nav-bg); backdrop-filter:saturate(140%) blur(10px); border-bottom:1px solid var(--border)}
+  .nav-inner{max-width:1000px; margin:0 auto; padding:12px 20px; display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap}
+  .brand{font-weight:700; font-size:19px; letter-spacing:.2px; color:var(--text); display:inline-flex; align-items:center; gap:9px}
+  .brand:hover{text-decoration:none}
+  .brand-ico{width:26px; height:26px; display:block; flex:none}
+  .brand b{color:var(--accent)}
+  .nav-links{display:flex; align-items:center; gap:16px; flex-wrap:wrap}
+  .nav-links a{color:var(--muted); font-weight:600; font-size:14px}
+  .nav-links a:hover{color:var(--text); text-decoration:none}
+  .theme-toggle{background:var(--surface); border:1px solid var(--border); color:var(--text); width:34px; height:34px; border-radius:var(--pill); cursor:pointer; font-size:16px; padding:0; display:inline-flex; align-items:center; justify-content:center; flex:none}
+
+  main{max-width:760px; margin:26px auto 70px; padding:0 20px}
+  .lead{color:var(--muted); font-size:15px; margin:0 0 8px}
+
+  .card{background:var(--card); border:1px solid var(--border); border-radius:var(--r); margin:18px 0; box-shadow:0 1px 3px rgba(0,0,0,.16)}
+  .card-h{padding:14px 18px; border-bottom:1px solid var(--border); font-weight:700; display:flex; align-items:center; justify-content:space-between; gap:10px}
+  .card-b{padding:18px}
+  .sub{color:var(--muted); font-size:13px; font-weight:400}
+  .coin-ico{width:20px; height:20px; border-radius:50%; display:block; flex:none}
+  .coin-name{display:inline-flex; align-items:center; gap:9px}
+
+  .btn{display:inline-flex; align-items:center; gap:7px; background:var(--btn); color:var(--on-accent); border:1px solid var(--btn); border-radius:var(--pill); padding:.55em 1.1em; font-weight:600; font-size:14px; cursor:pointer; transition:filter .15s ease; text-decoration:none}
+  .btn:hover{filter:brightness(1.08); text-decoration:none}
+  .btn.ghost{background:transparent; color:var(--text); border-color:var(--border)}
+  .btn.ghost:hover{border-color:var(--accent); background:var(--accent-bg)}
+  .btn.sm{padding:.35em .8em; font-size:13px}
+  .btn:focus-visible,.theme-toggle:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+
+  .addr{font-size:13px; word-break:break-all; color:var(--text); background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm); padding:10px 12px}
+  .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+  .stack{display:flex; flex-direction:column; gap:8px}
+  .muted{color:var(--muted)} .faint{color:var(--faint)}
+  ul.help{margin:6px 0 0; padding-left:18px; color:var(--muted)} ul.help li{margin:4px 0}
+
+  .qr{position:relative; background:#fff; padding:10px; border-radius:var(--r-sm); display:inline-block; line-height:0}
+  .qr>img{width:172px; height:172px; image-rendering:pixelated; display:block}
+  .qr-logo{position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:26%; height:26%; background:#fff; border-radius:7px; box-shadow:0 0 0 3px #fff; display:flex; align-items:center; justify-content:center}
+  .qr-logo img{width:100%; height:100%; display:block}
+
+  footer{border-top:1px solid var(--border); color:var(--muted); font-size:13px}
+  .foot-inner{max-width:1000px; margin:0 auto; padding:22px 20px; display:flex; gap:16px; flex-wrap:wrap; align-items:center; justify-content:center}
+  footer a{color:var(--muted)} footer a:hover{color:var(--text)}
+</style>
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a class="brand" href="/"><img class="brand-ico" src="favicon.svg" alt=""><span>Testnet<b>Wallet</b></span></a>
+      <div class="nav-links">
+        <a href="/">Wallet</a>
+        <a class="ext" href="https://cypherfaucet.com" target="_blank" rel="noopener">Faucet</a>
+        <a class="ext" href="https://testnetpool.com" target="_blank" rel="noopener">Pool</a>
+        <a class="ext" href="https://cyphertoshi.com" target="_blank" rel="noopener">Guides</a>
+        <a class="ext" href="https://github.com/Tech1k/testnetwallet.net" target="_blank" rel="noopener">Source</a>
+        <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">☀</button>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <h1>Support TestnetWallet</h1>
+    <p class="lead">TestnetWallet is free, open-source (AGPL-3.0), and runs entirely in your browser. It's testnet-only, so it never touches real funds.</p>
+    <p class="lead">These are voluntary <b>mainnet</b> tips that help cover the domain, block-explorer usage, and the Monero node behind it. Entirely optional, and thank you.</p>
+
+    <div class="card">
+      <div class="card-h"><span class="coin-name">OpenAlias</span></div>
+      <div class="card-b stack">
+        <p class="sub" style="margin:0">If your wallet supports OpenAlias, send to this alias and it resolves to the correct address for each coin automatically.</p>
+        <div class="addr" id="oa-addr">donate@testnetwallet.net</div>
+        <div class="row"><button class="btn ghost sm copybtn" data-copy="donate@testnetwallet.net">Copy</button></div>
+      </div>
+    </div>
+
+    <div class="card" data-coin="btc" data-addr="bc1qs69d78e4wg8h00mq7zmydlcfxytn5nzasjdceq" data-uri="bitcoin:bc1qs69d78e4wg8h00mq7zmydlcfxytn5nzasjdceq">
+      <div class="card-h"><span class="coin-name"><img class="coin-ico" src="icons/btc.svg" alt="">Bitcoin</span> <span class="sub">BTC · mainnet</span></div>
+      <div class="card-b stack">
+        <div class="qrslot" style="text-align:center"></div>
+        <div class="addr">bc1qs69d78e4wg8h00mq7zmydlcfxytn5nzasjdceq</div>
+        <div class="row">
+          <button class="btn ghost sm copybtn" data-copy="bc1qs69d78e4wg8h00mq7zmydlcfxytn5nzasjdceq">Copy</button>
+          <a class="btn ghost sm" href="bitcoin:bc1qs69d78e4wg8h00mq7zmydlcfxytn5nzasjdceq">Open in wallet</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" data-coin="ltc" data-addr="ltc1qesqzfuwfsdx8t3dmgnh2f79eflhav7qyrs7urn" data-uri="litecoin:ltc1qesqzfuwfsdx8t3dmgnh2f79eflhav7qyrs7urn">
+      <div class="card-h"><span class="coin-name"><img class="coin-ico" src="icons/ltc.svg" alt="">Litecoin</span> <span class="sub">LTC · mainnet</span></div>
+      <div class="card-b stack">
+        <div class="qrslot" style="text-align:center"></div>
+        <div class="addr">ltc1qesqzfuwfsdx8t3dmgnh2f79eflhav7qyrs7urn</div>
+        <div class="row">
+          <button class="btn ghost sm copybtn" data-copy="ltc1qesqzfuwfsdx8t3dmgnh2f79eflhav7qyrs7urn">Copy</button>
+          <a class="btn ghost sm" href="litecoin:ltc1qesqzfuwfsdx8t3dmgnh2f79eflhav7qyrs7urn">Open in wallet</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" data-coin="xmr" data-addr="89Dz4DkAskRDH6BMnQheh3iVpiRNzjLZA5qq7EPto5zaduDrQ5T3fB9UU1qU6p8acN52QvMLXLa65e6xTTNkiC7fN8FrtQK" data-uri="monero:89Dz4DkAskRDH6BMnQheh3iVpiRNzjLZA5qq7EPto5zaduDrQ5T3fB9UU1qU6p8acN52QvMLXLa65e6xTTNkiC7fN8FrtQK">
+      <div class="card-h"><span class="coin-name"><img class="coin-ico" src="icons/xmr.svg" alt="">Monero</span> <span class="sub">XMR · mainnet</span></div>
+      <div class="card-b stack">
+        <div class="qrslot" style="text-align:center"></div>
+        <div class="addr">89Dz4DkAskRDH6BMnQheh3iVpiRNzjLZA5qq7EPto5zaduDrQ5T3fB9UU1qU6p8acN52QvMLXLa65e6xTTNkiC7fN8FrtQK</div>
+        <div class="row">
+          <button class="btn ghost sm copybtn" data-copy="89Dz4DkAskRDH6BMnQheh3iVpiRNzjLZA5qq7EPto5zaduDrQ5T3fB9UU1qU6p8acN52QvMLXLa65e6xTTNkiC7fN8FrtQK">Copy</button>
+          <a class="btn ghost sm" href="monero:89Dz4DkAskRDH6BMnQheh3iVpiRNzjLZA5qq7EPto5zaduDrQ5T3fB9UU1qU6p8acN52QvMLXLa65e6xTTNkiC7fN8FrtQK">Open in wallet</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><span>Where it goes</span></div>
+      <div class="card-b">
+        <ul class="help">
+          <li>The <code>testnetwallet.net</code> domain and hosting</li>
+          <li>The Monero testnet node and light-wallet server (coming with Monero support)</li>
+          <li>The faucet and pool that keep the testnet playground stocked</li>
+          <li>Time spent building and maintaining the tools</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><span>Other ways to help</span></div>
+      <div class="card-b">
+        <ul class="help">
+          <li>Star or watch the project <a class="ext" href="https://github.com/Tech1k/testnetwallet.net" target="_blank" rel="noopener">on GitHub</a></li>
+          <li>Report bugs or suggest features in the issues</li>
+          <li>Run your own copy (it's a static site, AGPL-3.0)</li>
+          <li>Tell other testnet developers about it</li>
+        </ul>
+      </div>
+    </div>
+
+    <p class="sub" style="text-align:center">These tips don't buy testnet coins (those are free and worth nothing) and don't unlock anything. The wallet is free and always will be.</p>
+  </main>
+
+  <footer>
+    <div class="foot-inner">
+      <a href="/">Wallet</a>
+      <a class="ext" href="https://cypherfaucet.com" target="_blank" rel="noopener">Faucet</a>
+      <a class="ext" href="https://testnetpool.com" target="_blank" rel="noopener">Pool</a>
+      <a class="ext" href="https://cyphertoshi.com" target="_blank" rel="noopener">Guides</a>
+      <a class="ext" href="https://github.com/Tech1k/testnetwallet.net" target="_blank" rel="noopener">Source</a>
+      <span class="faint">·</span>
+      <span>Made by <a class="ext" href="https://tech1k.com" target="_blank" rel="noopener">Tech1k</a></span>
+    </div>
+  </footer>
+
+  <script src="vendor/qrcode.js"></script>
+  <script src="donate.js"></script>
+</body>
+</html>

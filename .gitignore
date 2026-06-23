@@ -1,0 +1,12 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+
+# vendor/ is committed on purpose; it holds the self-contained deps (no build step).
+# The Monero engine bundle in vendor/ IS committed; only the bundler's install dir is ignored.
+tools/monero-bundle/node_modules/
+tools/monero-bundle/package-lock.json
+raw.txt

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later
+     TestnetWallet crypto tests. No build step: serve the folder and open this page.
+       python3 -m http.server 8080   →   http://localhost:8080/tests.html
+     It re-runs the modules' own exported selfTest()s (the same gates the app uses at boot) AND checks
+     address derivation against published known-answer vectors (BIP44/49/84/86, Electrum) through the SAME
+     vendored @scure/@noble libraries the wallet ships - so a swapped/broken vendored dep fails here loudly.
+     Logic is in tests.js (external, so it runs under the site's strict CSP too). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TestnetWallet - crypto tests</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,Inter,sans-serif; background:#14161b; color:#e6e8ec; margin:0; padding:24px; line-height:1.5}
+  h1{font-size:20px; margin:0 0 4px} .sub{color:#9aa0ab; font-size:13px; margin:0 0 18px}
+  #summary{font-size:16px; font-weight:700; padding:10px 14px; border-radius:10px; margin:0 0 16px; display:inline-block}
+  .pass-all{background:rgba(79,191,117,.15); border:1px solid #4fbf75; color:#7ed99a}
+  .fail-any{background:rgba(239,107,107,.15); border:1px solid #ef6b6b; color:#f29a9a}
+  .grp{margin:0 0 18px} .grp h2{font-size:14px; color:#9db2ff; margin:0 0 8px; font-weight:600}
+  .row{display:flex; gap:10px; align-items:baseline; padding:5px 8px; border-bottom:1px solid #2a2e37; font-size:13.5px}
+  .ic{flex:none; width:18px; font-weight:700}
+  .ok .ic{color:#4fbf75} .bad .ic{color:#ef6b6b} .bad{background:rgba(239,107,107,.07)}
+  .name{flex:1} .detail{color:#9aa0ab; font-family:ui-monospace,monospace; font-size:12px; word-break:break-all; max-width:55%}
+  code{font-family:ui-monospace,monospace; color:#9db2ff}
+</style>
+</head>
+<body>
+<h1>TestnetWallet crypto self-tests + known-answer vectors</h1>
+<p class="sub">Re-runs the wallet's own <code>selfTest()</code>s and checks address derivation against published vectors. All green = the vendored crypto + derivation are producing the right addresses in this browser.</p>
+<div id="summary">Running…</div>
+<div id="results"></div>
+<script type="module" src="tests.js"></script>
+</body>
+</html>

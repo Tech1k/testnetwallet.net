@@ -1,0 +1,17 @@
+{
+  "name": "TestnetWallet",
+  "short_name": "TestnetWallet",
+  "description": "A testnet HD wallet and developer playground for Bitcoin, Litecoin and Monero.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#14161b",
+  "theme_color": "#5271ff",
+  "icons": [
+    { "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
