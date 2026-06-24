@@ -212,9 +212,10 @@ function changePassword(newPassword){
 function disableEncryption(){
   if(!_cryptoKey) return Promise.reject(new Error('unlock first'));
   return runExclusive(async ()=>{
-    await migrateXmrCaches(false, _cryptoKey);
+    const key = _cryptoKey;
     _encOn = false; _cryptoKey = null; _vaultSalt = null; _locked = false;
-    await saveStoreNow();   // writes plaintext (intended)
+    localStorage.setItem(LS_KEY, JSON.stringify(store));   // write the plaintext SEED first, directly (a deliberate disable legitimately replaces the vault, so it bypasses saveStoreNow's cross-tab anti-clobber guard); the on-disk marker flips to 'unlocked' before any cache is decrypted
+    await migrateXmrCaches(false, key);                    // then decrypt the caches; if interrupted here, the still-encrypted caches are simply re-synced - never a locked-but-plaintext-cache state
   });
 }
 /* Decrypt the vault with a password and load the store. Returns true on success. */
@@ -342,12 +343,14 @@ function renderFaucet(address){
     try {
       const j = await faucetClaim(slug, address);
       const fc = COINS[state.coin];
+      const txUrl = fc.addrModel === 'monero' ? xmrExplorerTx(j.txid) : (fc.explorer + '/tx/' + encodeURIComponent(j.txid));
       const okMsg = el('div',{class:'msg ok'}, '✓ ' + (j.amount ? (j.amount + ' ' + fc.ticker + ' ') : '') + 'sent from the faucet. It will appear in your balance shortly.');
-      if(j.txid) okMsg.append(el('div',{class:'sub',style:'margin-top:4px'}, 'Transaction: ',
-        el('a',{class:'addr',href:fc.explorer + '/tx/' + encodeURIComponent(j.txid),target:'_blank',rel:'noopener'}, String(j.txid).slice(0,24) + '…')));
+      if(j.txid && txUrl) okMsg.append(el('div',{class:'sub',style:'margin-top:4px'}, 'Transaction: ',
+        el('a',{class:'addr',href:txUrl,target:'_blank',rel:'noopener'}, String(j.txid).slice(0,24) + '…')));
       clear(out).append(okMsg);
-      // the faucet tx takes a few seconds to broadcast and get indexed; poll a few times so the balance updates without a manual refresh
-      [3000, 9000, 20000, 40000].forEach(ms => setTimeout(()=>{ if(state.wallet && !isLocked()) refresh(); }, ms));
+      // poll so the balance updates without a manual refresh; Monero needs a sync (refresh() no-ops for it)
+      [3000, 9000, 20000, 40000].forEach(ms => setTimeout(()=>{ if(!state.wallet || isLocked()) return;
+        if(COINS[state.coin].addrModel === 'monero'){ if(!state.xmr.syncing) moneroSync(); } else refresh(); }, ms));
     } catch(e){
       const rate = e.code === 'rate_limited' || e.code === 'ip_rate_limited' || e.code === 'daily_cap';
       clear(out).append(el('div',{class:'msg ' + (rate ? 'warn' : 'bad')},
@@ -464,6 +467,7 @@ function openWallet(w){
   if(state.scheme !== 'bip39'){                              // Electrum wallet: root cached at import (sync), no Monero
     state.master = HDKey.fromExtendedKey(w.xprv);
     state.addrType = ELECTRUM_SCHEMES[state.scheme].addrType; state.account = 0; state.xmrKeys = null;
+    if(COINS[state.coin].addrModel === 'monero'){ state.coin = 'btc'; saveSettings(); }   // an Electrum wallet has no Monero keys; don't strand on the Monero view
     state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };
     state.xmrAccount = 0; store.activeId = w.id; saveStore(); buildAddresses(); render(); refresh(); return;
   }
@@ -573,7 +577,7 @@ async function electrumImport(rawSeed, name, passphrase){
 function snapshotData(){
   return {
     type:'testnetwallet-backup', version:2, exportedAt: new Date().toISOString(),
-    wallets: (store.wallets||[]).map(w => ({ id:w.id, name:w.name, mnemonic:w.mnemonic, ...(w.passphrase?{passphrase:w.passphrase}:{}), ...(w.scheme?{scheme:w.scheme,xprv:w.xprv}:{}) })),
+    wallets: (store.wallets||[]).map(w => ({ id:w.id, name:w.name, mnemonic:w.mnemonic, ...(w.passphrase?{passphrase:w.passphrase}:{}), ...(w.scheme?{scheme:w.scheme,xprv:w.xprv}:{}), ...(w.createdAt?{createdAt:w.createdAt}:{}) })),
     activeId: store.activeId || null,
     counts: store.counts || {},
     txNotes: store.txNotes || {},
@@ -622,13 +626,13 @@ function importBackup(data){
       try { HDKey.fromExtendedKey(w.xprv); } catch(_){ return null; }
       return { id:(typeof w.id==='string' && w.id) || uid(), name:(typeof w.name==='string' && w.name.trim()) || '',
         scheme:w.scheme, mnemonic: typeof w.mnemonic==='string' ? w.mnemonic : '', xprv:w.xprv,
-        passphrase: typeof w.passphrase==='string' ? w.passphrase : '' };
+        passphrase: typeof w.passphrase==='string' ? w.passphrase : '', ...(typeof w.createdAt==='number'?{createdAt:w.createdAt}:{}) };
     }
     const m = normalizePhrase((w && w.mnemonic) || '');
     if(!validateMnemonic(m, wordlist)) return null;
     return { id:(typeof w.id==='string' && w.id) || uid(),
       name:(typeof w.name==='string' && w.name.trim()) || '',
-      mnemonic:m, passphrase: typeof w.passphrase==='string' ? w.passphrase : '' };
+      mnemonic:m, passphrase: typeof w.passphrase==='string' ? w.passphrase : '', ...(typeof w.createdAt==='number'?{createdAt:w.createdAt}:{}) };
   };
   const valid = incoming.map(norm).filter(Boolean);
   if(!valid.length) throw new Error('no valid recovery phrases in this file');
@@ -643,6 +647,7 @@ function importBackup(data){
     if(store.wallets.some(x => x.id === w.id)) w.id = uid();            // keep ids (so counts/notes line up), but never collide
     const rec = { id:w.id, name: w.name || ('Wallet '+(store.wallets.length+1)), mnemonic:w.mnemonic };
     if(w.passphrase) rec.passphrase = w.passphrase;
+    if(w.createdAt) rec.createdAt = w.createdAt;
     if(w.scheme && ELECTRUM_SCHEMES[w.scheme]){ rec.scheme = w.scheme; rec.xprv = w.xprv; }
     store.wallets.push(rec); have.add(sig(w)); addedW++;
   }
@@ -911,7 +916,10 @@ function renderMoneroHero(c){
   const balLine = (sx.synced && sx.balance != null) ? (fmtXmr(sx.balance) + ' XMR') : '- XMR';
   let status;
   if(sx.syncing) status = el('div',{id:'xmr-sync',class:'fiat'}, ...xmrStatusInner());
-  else if(sx.synced) status = el('div',{class:'fiat'}, sx.txs.length + ' transaction' + (sx.txs.length===1?'':'s') + ' · ' + net.label + ', no real value');
+  else if(sx.synced){
+    const fiatStr = (sx.price != null && sx.balance != null && sx.balance > 0n) ? ('≈ ' + FIATS[state.fiat] + (Number(sx.balance)/1e12 * sx.price).toFixed(2) + ' ' + state.fiat + ' · ') : '';
+    status = el('div',{class:'fiat'}, fiatStr + sx.txs.length + ' transaction' + (sx.txs.length===1?'':'s') + ' · ' + net.label + ', no real value');
+  }
   else if(!nodeUrl) status = el('div',{class:'fiat'}, 'Set a Monero node in Settings to load your balance.');
   else status = el('div',{class:'fiat'}, 'Balance loads on demand (downloads a ~6 MB engine, then scans the chain)');
   const actions = [ el('button',{class:'btn ghost',onclick:()=>{ state.tab='receive'; render(); }}, '↓ Receive') ];
@@ -961,8 +969,8 @@ function renderXmrRestore(){
     const v = hInput.value.trim();
     const h = v==='' ? null : Math.max(0, parseInt(v,10) || 0);
     setXmrRestore(walletId, net, h);
-    if(sx.synced || sx.wallet){                            // a scan cache exists -> a new start height needs a fresh scan
-      try { await xmrCacheDel(xmrDataKey(walletId, net)); } catch(_){}   // drop the stale IndexedDB cache so the re-scan starts from the new restore height
+    try { await xmrCacheDel(xmrDataKey(walletId, net)); } catch(_){}   // a changed restore height invalidates any persisted cache; drop it in BOTH branches so the next sync rescans from the new height (no-op if none)
+    if(sx.synced || sx.wallet){                            // a scan was already running this session -> re-scan now
       state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };
       toast('Restore height set. Re-scanning…','ok');
       moneroSync();
@@ -1644,7 +1652,7 @@ function txActions(t, c){
 /* ----------------------------- coin / type switching ----------------------------- */
 function switchCoin(coin){ if(!COINS[coin].enabled||coin===state.coin) return; state.coin=coin; _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); render(); refresh(); }
 function switchType(type){ if(type===state.addrType) return; state.addrType=type; saveSettings(); buildAddresses(); render(); refresh(); }
-function switchXmrNet(net){ if(net===state.xmrNet || !xmr.XMR_NETS[net]) return; state.xmrNet=net; state.xmrAccount=0;
+function switchXmrNet(net){ if(net===state.xmrNet || !xmr.XMR_NETS[net] || state.xmr.syncing) return; state.xmrNet=net; state.xmrAccount=0;
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };   // each net has its own balance + cache; reset so the new net re-syncs (auto-resumes from its own cache)
   saveSettings(); buildAddresses(); render(); }
 
@@ -1708,11 +1716,10 @@ function xmrNodeLineInner(){
   return [ el('span',{}, txt) ];
 }
 function renderXmrNodeLine(){ const e = $('xmr-node'); if(!e) return; clear(e); for(const c of xmrNodeLineInner()) e.append(c); }
-const XMR_FALLBACK_HEIGHT = { testnet: 3000000, stagenet: 1800000 };   // recent-ish floors so a failed height lookup never scans from genesis
 const XMR_FRESH_LOOKBACK = 200;   // first-sync default: scan only the last ~200 blocks (~6h on testnet/stagenet) so a fresh wallet syncs in seconds; deeper history uses the restore-height control
-// persist the synced wallet (keys + block cache) per wallet/network so re-sync only scans NEW blocks
-// Monero keys+cache live in their OWN localStorage keys, not the main store blob (the cache is multi-MB;
-// keeping it out keeps saveStore() small and stops an oversized cache from making every save throw on quota).
+// persist the synced wallet (keys + block cache) per wallet/network so re-sync only scans NEW blocks.
+// The cache is multi-MB, so it lives in IndexedDB (localStorage's ~5MB quota overflowed) under its own
+// per-wallet/network key, separate from the main store blob.
 const XMR_DATA_PREFIX = 'testnetwallet.xmr.';
 function xmrDataKey(walletId, net){ return XMR_DATA_PREFIX + walletId + '.' + net; }
 /* The monero-ts wallet cache is multi-MB and overflows localStorage's ~5MB quota (so it never persisted and
@@ -1725,7 +1732,7 @@ function xmrDb(){
     let r; try { r = indexedDB.open(XMR_DB, 1); } catch(e){ rej(e); return; }
     r.onupgradeneeded = ()=>{ try { r.result.createObjectStore(XMR_STORE); } catch(_){} };
     r.onsuccess = ()=>res(r.result); r.onerror = ()=>rej(r.error);
-  });
+  }).catch(e => { _xmrDbP = null; throw e; });   // never cache a rejected open: retry on the next call after a transient failure
   return _xmrDbP;
 }
 function xmrDbReq(mode, fn){
@@ -1754,7 +1761,8 @@ function saveXmrData(walletId, net, keysData, cacheData){
     if(_encOn && !_cryptoKey) return;     // re-check: a lock/disable may have landed before this ran
     try {
       if(_encOn && _cryptoKey){ const e = await encWith(_cryptoKey, JSON.stringify(plain)); await xmrCachePut(xmrDataKey(walletId, net), { tnwvault:1, iv:e.iv, ct:e.ct }); }
-      else await xmrCachePut(xmrDataKey(walletId, net), plain);
+      else { try { const cur = JSON.parse(localStorage.getItem(LS_KEY)); if(cur && cur.tnwvault){ _encOn=true; _locked=true; _cryptoKey=null; try{ render(); }catch(_){} return; } } catch(_){}   // another tab enabled encryption: never write a plaintext spend key over a vault
+        await xmrCachePut(xmrDataKey(walletId, net), plain); }
     } catch(e){ console.warn('[monero] cache not persisted:', e); }
   }).catch(()=>{});
 }
@@ -1782,6 +1790,8 @@ async function moneroSync(){
     let wallet = null, fresh = true;
     let info = null;   // node status + chain tip up front, so the progress bar has a target before monero-ts emits events
     try { info = await moneroEngine.getDaemonInfo(nodeUrl); sx.node = { url:nodeUrl, at:Date.now(), ...info }; if(info.ok && info.height){ sx.endHeight = info.height; renderXmrNodeLine(); } } catch(_){}
+    if(!moneroEngine.isLoaded()) await moneroEngine.load();   // let the 'Loading engine' phase show, then move on to 'Connecting'
+    if(sx.phase !== 'scanning'){ sx.phase = 'connecting'; renderXmrStatus(); }
     const saved = await loadXmrData(walletId, net);
     if(saved){                                              // resume from the saved cache (only scans new blocks)
       try { wallet = await moneroEngine.openSaved({ network:net, nodeUrl, keysData:saved.keysData, cacheData:saved.cacheData }); fresh = false; sx.restoreHeight = 0; render(); }
@@ -1825,6 +1835,7 @@ async function moneroSync(){
       sx.unlocked = big(await wallet.getUnlockedBalance(state.xmrAccount || 0)); }
     try { sx.txs = await wallet.getTxs(); } catch(_){ sx.txs = []; }
     sx.synced = true;
+    getPrice('XMR', state.fiat).then(p => { if(state.xmr === sx && state.coin === 'xmr'){ sx.price = p; render(); } }).catch(()=>{});   // XMR fiat estimate for the hero
     try { const d = await moneroEngine.getData(wallet); if(d && d[0] && d[1]) saveXmrData(walletId, net, d[0], d[1]); }   // persist for fast re-sync
     catch(e){ console.warn('[monero] getData failed:', e); }
   } catch(e){ sx.error = e.message || String(e); }
@@ -2103,6 +2114,8 @@ function actWallets(editId){
         store.wallets = (store.wallets||[]).filter(x=>x.id!==w.id);
         if(store.counts) delete store.counts[w.id];
         if(store.txNotes) delete store.txNotes[w.id];
+        if(store.xmrLabels) delete store.xmrLabels[w.id];
+        if(store.settings && store.settings.xmrRestore) delete store.settings.xmrRestore[w.id];
         deleteXmrData(w.id);                                   // purge the wallet's Monero keys+cache too
         saveStore();
         if(state.wallet && state.wallet.id===w.id){
@@ -3558,7 +3571,7 @@ function actSettings(){
       el('div',{class:'field'}, el('label',{class:'fld'},'Litecoin Esplora API'), apiField('ltc')),
       el('div',{class:'field'}, el('label',{class:'fld'},'Monero node RPC (stagenet)'), xmrNodeField('stagenet')),
       el('div',{class:'field'}, el('label',{class:'fld'},'Monero node RPC (testnet)'), xmrNodeField('testnet')),
-      el('div',{class:'sub faint',style:'margin-top:0'},'Fields are prefilled with the built-in default; leave one as-is to keep using it (it updates with new releases), or enter your own Esplora instance or Monero node and press Default to revert. Stagenet has no public default, so add your own node there. A custom origin must also be allowed by the page Content-Security-Policy (connect-src in _headers), which you control when self-hosting. The Monero node needs CORS (--rpc-access-control-origins), and HTTPS on an https site.'),
+      el('div',{class:'sub faint',style:'margin-top:0'},'Fields are prefilled with the built-in default; leave one as-is to keep using it (it updates with new releases), or enter your own Esplora instance or Monero node and press Default to revert. A custom origin must also be allowed by the page Content-Security-Policy (connect-src in _headers), which you control when self-hosting. The Monero node needs CORS (--rpc-access-control-origins), and HTTPS on an https site.'),
       el('div',{class:'sub faint'},'Privacy: each refresh reveals your addresses to the block explorer, and the fiat estimate sends the coin to the price API; both can tie those to your IP. Over Tor that stays a deanonymization surface.'),
       el('hr',{class:'hr'}),
       el('div',{class:'sub'},'Danger zone'), clearBtn,
