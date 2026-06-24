@@ -834,7 +834,8 @@ function renderOnboarding(){
         el('p',{class:'muted'},'A safe place to learn and build on the Bitcoin, Litecoin and Monero testnets. Practice with crypto where real value is never at risk. Your recovery phrase and keys stay in this browser.'),
         el('div',{class:'row',style:'margin-top:8px'},
           el('button',{class:'btn',onclick:actCreate},'Create new wallet'),
-          el('button',{class:'btn ghost',onclick:actImport},'Import recovery phrase')),
+          el('button',{class:'btn ghost',onclick:actImport},'Import recovery phrase'),
+          el('button',{class:'btn ghost',onclick:actRestoreBackup},'Restore from backup')),
         el('p',{class:'sub',style:'margin-top:16px'},'Need coins to practice with? Grab free test coins from ',
           el('a',{href:'https://cypherfaucet.com',target:'_blank',rel:'noopener'},'CypherFaucet'),'.'))),
     learn);
@@ -2030,6 +2031,21 @@ function handleBackupFile(text, msgEl, inputEl){
     try { finishImport(importBackup(data)); } catch(e){ msgEl.append(el('div',{class:'msg bad'},'Import failed: '+(e.message||e))); }
   }
   if(inputEl) inputEl.value='';
+}
+// Restore a full backup file from onboarding (before any wallet exists) - the same flow Settings uses, in a modal.
+function actRestoreBackup(){
+  const fileInput = el('input',{type:'file',accept:'application/json,.json',style:'display:none'});
+  const msg = el('div',{style:'margin-top:8px'});
+  const pickBtn = el('button',{class:'btn'},'Choose backup file');
+  pickBtn.addEventListener('click', ()=>fileInput.click());
+  fileInput.addEventListener('change', ()=>{ const f=fileInput.files[0]; if(!f) return; const reader=new FileReader();
+    reader.onload=()=> handleBackupFile(reader.result, msg, fileInput); reader.readAsText(f); });
+  showModal(el('div',{},
+    el('div',{class:'card-h'},'Restore from backup'),
+    el('div',{class:'card-b'},
+      el('p',{class:'sub'},'Choose a TestnetWallet backup file (.json). It restores every wallet, plus contacts, notes and settings. An encrypted backup will ask for its password.'),
+      el('div',{class:'row'}, pickBtn, el('button',{class:'btn ghost',onclick:closeModal},'Cancel')),
+      fileInput, msg)));
 }
 /* backup (reveal phrase + export/import file) */
 function actBackup(){
