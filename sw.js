@@ -3,7 +3,7 @@
  * Strategy: NETWORK-FIRST for same-origin requests (so online users always get the freshest code - important for a
  * wallet), falling back to the cache only when offline. Cross-origin requests (block explorers, the Monero node,
  * price APIs) are never intercepted or cached. Bump CACHE to invalidate old caches on deploy. */
-const CACHE = 'tnw-v3';
+const CACHE = 'tnw-v4';
 const SHELL = [
   './', './index.html', './app.js',
   './bip322.mjs', './monero.mjs', './monero-mnemonic.mjs', './monero-engine.mjs',
