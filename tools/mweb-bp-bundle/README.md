@@ -8,7 +8,7 @@ module that the wallet lazy-loads - exactly like the Monero engine in `tools/mon
 
 Everything else in an MWEB send (stealth outputs, inputs, kernel, balance/offsets, the
 MW/Grin Schnorr signatures, serialization, broadcast) is pure JS in `mweb.mjs` /
-`mweb-tx.mjs`. This is the only native dependency.
+`mweb.mjs`. This is the only native dependency.
 
 ## Why a WASM build (not a JS port or an npm package)
 
@@ -32,7 +32,7 @@ bundle. If the build breaks on a newer toolchain, pin a known-good emscripten ve
 `secp256k1_bulletproof_rangeproof_prove` signature in `include/secp256k1_bulletproofs.h`
 against `main.c` (forks occasionally reorder args).
 
-## JS load contract (what `mweb-tx.mjs` expects)
+## JS load contract (what `mweb.mjs` expects)
 
 ```js
 const { default: MwebBP } = await import('./vendor/mweb-bp.js');

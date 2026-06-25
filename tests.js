@@ -26,16 +26,19 @@ function eq(g, name, actual, expected){ row(g, actual===expected, name, actual==
 const MN = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
 // ---------- 1. Module self-tests (the exact gates the app runs at boot) ----------
+// Run a module's selfTest() and render a header row + one indented sub-row per check (with its computed value).
+function selfTestGroup(g, label, run){
+  let r; try { r = run(); } catch(e){ row(g, false, label, String(e)); return; }
+  const n = r.checks ? r.checks.length : 0;
+  row(g, !!r.ok, label, r.ok ? (n ? (n + ' checks passed') : 'pass') : JSON.stringify(r.fails));
+  if(r.checks) for(const c of r.checks) row(g, c.ok, ' • ' + c.name, c.detail || '');   // em-space + bullet = indented sub-check
+}
 function groupSelfTests(){
   const g = group('1. Module self-tests (same as the app boots with)');
-  try { const r = bip322.selfTest(btc.TEST_NETWORK); row(g, !!r.ok, 'BIP-322 message signing', r.ok?'pass':JSON.stringify(r.fails)); }
-  catch(e){ row(g, false, 'BIP-322 message signing', String(e)); }
-  try { const r = xmr.selfTest(); row(g, !!r.ok, 'Monero key derivation / address encoding', r.ok?'pass':JSON.stringify(r.fails)); }
-  catch(e){ row(g, false, 'Monero key derivation', String(e)); }
-  try { const r = xmrSeed.selfTest(); row(g, !!r.ok, 'Monero 25-word portable seed', r.ok?'pass':JSON.stringify(r.fails)); }
-  catch(e){ row(g, false, 'Monero 25-word seed', String(e)); }
-  try { const r = mweb.selfTest(); row(g, !!r.ok, 'Litecoin MWEB crypto (scan + tmweb address + Schnorr)', r.ok?'pass':JSON.stringify(r.fails)); }
-  catch(e){ row(g, false, 'Litecoin MWEB crypto', String(e)); }
+  selfTestGroup(g, 'BIP-322 message signing', () => bip322.selfTest(btc.TEST_NETWORK));
+  selfTestGroup(g, 'Monero key derivation / address encoding', () => xmr.selfTest());
+  selfTestGroup(g, 'Monero 25-word portable seed', () => xmrSeed.selfTest());
+  selfTestGroup(g, 'Litecoin MWEB crypto (scan + tmweb address + Schnorr)', () => mweb.selfTest());
 }
 
 // ---------- 2. BIP39 seed + BIP44/49/84/86 address KATs (mainnet published vectors) ----------

@@ -98,24 +98,24 @@ export function subaddress(keys, net, major, minor){
 /* Self-test against canonical vectors. Gates the UI: if this fails, no addresses are shown.
  * Guards the two classic silent-failure traps (keccak-vs-sha3, generic-vs-block base58) plus point encoding. */
 export function selfTest(){
-  const fails = [];
-  const eq = (a, b) => a === b;
-  // 1. keccak_256("") - guards against accidentally using sha3_256 (different padding -> different digest).
-  if(!eq(bytesToHex(keccak_256(new Uint8Array(0))), 'c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470'))
-    fails.push('keccak_256 known-answer (wrong hash - sha3 instead of keccak?)');
-  // 2. ed25519 base point encoding - guards Point.toBytes() byte order/sign.
-  if(!eq(bytesToHex(Point.BASE.toBytes()), '5866666666666666666666666666666666666666666666666666666666666666'))
-    fails.push('ed25519 base point encoding');
-  // 3. canonical mainnet address round-trips through base58 + checksum (guards base58 block algo + checksum).
-  const CANON = '4AdUndXHHZ6cfufTMvppY6JwXNouMBzSkbLYfpAV5Usx3skxNgYeYTRj5UzqtReoS44qo9mtmXCqY45DJ852K5Jv2684Rge';
-  try {
+  const checks = [];
+  const chk = (name, fn) => { try { const d = fn(); checks.push({ name, ok:true, detail: d || '' }); } catch(e){ checks.push({ name, ok:false, detail: e.message || String(e) }); } };
+  // keccak_256("") - guards against accidentally using sha3_256 (different padding -> different digest).
+  chk('keccak_256("") KAT', () => { const h = bytesToHex(keccak_256(new Uint8Array(0))); if(h !== 'c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470') throw new Error('wrong hash (sha3 instead of keccak?)'); return h.slice(0,16)+'…'; });
+  // ed25519 base point encoding - guards Point.toBytes() byte order/sign.
+  chk('ed25519 base point encoding', () => { const h = bytesToHex(Point.BASE.toBytes()); if(h !== '5866666666666666666666666666666666666666666666666666666666666666') throw new Error('byte order/sign'); return h.slice(0,12)+'…'; });
+  // canonical mainnet address round-trips through base58 + checksum (guards base58 block algo + checksum).
+  chk('mainnet address base58 + checksum round-trip', () => {
+    const CANON = '4AdUndXHHZ6cfufTMvppY6JwXNouMBzSkbLYfpAV5Usx3skxNgYeYTRj5UzqtReoS44qo9mtmXCqY45DJ852K5Jv2684Rge';
     const raw = b58decode(CANON);
-    if(raw.length !== 69) fails.push('base58 decode length');
-    if(raw[0] !== 18) fails.push('mainnet prefix byte');
-    if(!eq(bytesToHex(keccak_256(raw.slice(0, 65)).slice(0, 4)), bytesToHex(raw.slice(65, 69)))) fails.push('address checksum');
-    if(!eq(b58encode(raw), CANON)) fails.push('base58 re-encode round-trip');
-  } catch(e){ fails.push('base58 decode threw: ' + (e.message || e)); }
-  return { ok: fails.length === 0, fails };
+    if(raw.length !== 69) throw new Error('base58 decode length');
+    if(raw[0] !== 18) throw new Error('mainnet prefix byte');
+    if(bytesToHex(keccak_256(raw.slice(0, 65)).slice(0, 4)) !== bytesToHex(raw.slice(65, 69))) throw new Error('address checksum');
+    if(b58encode(raw) !== CANON) throw new Error('base58 re-encode');
+    return CANON.slice(0,8)+'…'+CANON.slice(-6);
+  });
+  const fails = checks.filter(c => !c.ok).map(c => c.name + (c.detail ? (': ' + c.detail) : ''));
+  return { ok: fails.length === 0, fails, checks };
 }
 
 export { bytesToHex as hex };

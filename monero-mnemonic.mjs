@@ -60,25 +60,28 @@ export function decode25(mnemonic){
 
 /* Validate the codec + the whole derivation chain against a real wallet (gate before exposing in UI). */
 export function selfTest(){
-  const fails = [];
-  const hex = b => { let s = ''; for(const x of b) s += x.toString(16).padStart(2, '0'); return s; };
-  // 1. codec round-trip
-  try {
+  const checks = [];
+  const hx = b => { let s = ''; for(const x of b) s += x.toString(16).padStart(2, '0'); return s; };
+  const chk = (name, fn) => { try { const d = fn(); checks.push({ name, ok:true, detail: d || '' }); } catch(e){ checks.push({ name, ok:false, detail: e.message || String(e) }); } };
+  chk('25-word encode/decode round-trip', () => {
     const probe = new Uint8Array(32); for(let i=0;i<32;i++) probe[i] = (i*7 + 1) & 0xff;
-    if(hex(decode25(encode25(probe))) !== hex(probe)) fails.push('25-word encode/decode round-trip');
-  } catch(e){ fails.push('round-trip threw: ' + (e.message || e)); }
-  // 2. full chain through the PRODUCTION derive + subaddress: monero-ts test wallet mnemonic -> its testnet primary address.
-  //    Gating receive on this (state.xmrOk) means a regression in keysFromSpendSecret/subaddress/encodeAddress disables Monero.
-  const MN = 'silk mocked cucumber lettuce hope adrenalin aching lush roles fuel revamp baptism wrist long tender teardrop midst pastry pigment equip frying inbound pinched ravine frying';
-  const ADDR = 'A1y9sbVt8nqhZAVm3me1U18rUVXcjeNKuBd1oE2cTs8biA9cozPMeyYLhe77nPv12JA3ejJN3qprmREriit2fi6tJDi99RR';
-  try {
+    if(hx(decode25(encode25(probe))) !== hx(probe)) throw new Error('mismatch');
+    return 'ok';
+  });
+  // full chain through the PRODUCTION derive + subaddress: monero-ts test wallet mnemonic -> its testnet primary address.
+  // Gating receive on this (state.xmrOk) means a regression in keysFromSpendSecret/subaddress/encodeAddress disables Monero.
+  chk('monero-ts test vector: seed -> testnet primary address', () => {
+    const MN = 'silk mocked cucumber lettuce hope adrenalin aching lush roles fuel revamp baptism wrist long tender teardrop midst pastry pigment equip frying inbound pinched ravine frying';
+    const ADDR = 'A1y9sbVt8nqhZAVm3me1U18rUVXcjeNKuBd1oE2cTs8biA9cozPMeyYLhe77nPv12JA3ejJN3qprmREriit2fi6tJDi99RR';
     const keys = keysFromSpendSecret(decode25(MN));                       // legacy seed: the 32 decoded bytes ARE the spend secret
-    if(subaddress(keys, XMR_NETS.testnet, 0, 0) !== ADDR) fails.push('test-vector: primary address mismatch');
-    const sub = subaddress(keys, XMR_NETS.testnet, 0, 1);                 // exercise the (major,minor)!=0 branch: D=B+m*G, C=a*D
+    if(subaddress(keys, XMR_NETS.testnet, 0, 0) !== ADDR) throw new Error('primary address mismatch');
+    const sub = subaddress(keys, XMR_NETS.testnet, 0, 1);                 // exercise (major,minor)!=0: D=B+m*G, C=a*D
     const raw = b58decode(sub);
-    if(raw.length !== 69 || raw[0] !== XMR_NETS.testnet.subaddress) fails.push('subaddress prefix/length');
-    else if(hex(keccak_256(raw.slice(0, 65)).slice(0, 4)) !== hex(raw.slice(65))) fails.push('subaddress checksum');
-    if(sub === ADDR) fails.push('subaddress equals primary');
-  } catch(e){ fails.push('test-vector threw: ' + (e.message || e)); }
-  return { ok: fails.length === 0, fails };
+    if(raw.length !== 69 || raw[0] !== XMR_NETS.testnet.subaddress) throw new Error('subaddress prefix/length');
+    if(hx(keccak_256(raw.slice(0, 65)).slice(0, 4)) !== hx(raw.slice(65))) throw new Error('subaddress checksum');
+    if(sub === ADDR) throw new Error('subaddress equals primary');
+    return ADDR.slice(0,10)+'…';
+  });
+  const fails = checks.filter(c => !c.ok).map(c => c.name + (c.detail ? (': ' + c.detail) : ''));
+  return { ok: fails.length === 0, fails, checks };
 }

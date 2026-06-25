@@ -375,7 +375,8 @@ async function rangeProof(value, switchBlind32, extraBytes) {
 
 /* ---- send-side output (commitment, Ks, Ko, message, proof, signature) ---- */
 function serializeOutputMessage(o) {   // features(1)||Ke(33)||view_tag(1)||masked_value(8)||masked_nonce(16) = 59B
-  return concatBytes(Uint8Array.of(STD_FEATURE_BIT), hexToBytes(o.Ke), Uint8Array.of(o.viewTag), o.maskedValue, o.maskedNonce);
+  const ke = (o.Ke instanceof Uint8Array) ? o.Ke : hexToBytes(o.Ke);   // outputCreate gives Ke as bytes; tolerate a hex string too
+  return concatBytes(Uint8Array.of(STD_FEATURE_BIT), ke, Uint8Array.of(o.viewTag), o.maskedValue, o.maskedNonce);
 }
 async function buildSendOutput(scanPub, spendPub, value, ksScalar) {
   const ks = ksScalar != null ? sc(ksScalar) : fromB(secp.utils.randomPrivateKey());
@@ -474,59 +475,46 @@ async function buildTransaction({ coins, recipients, fee }) {
 
 /* ---------------- Self-test (run in-browser; gates the feature) ---------------- */
 function selfTest() {
-  const fails = [];
-  // 1) SHA-512 known-answer (empty string)
-  try {
-    const empty = bytesToHex(sha512(new Uint8Array(0)));
-    if (empty !== 'cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e')
-      fails.push('sha512 KAT');
-  } catch (e) { fails.push('sha512: ' + (e.message || e)); }
-  // 2) BLAKE3 KAT (empty input) - the libmw hash primitive
-  try {
-    if (bytesToHex(blake3(new Uint8Array(0))) !== 'af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262')
-      fails.push('blake3 KAT');
-  } catch (e) { fails.push('blake3: ' + (e.message || e)); }
-  // 3) generators are valid on-curve points
-  try { H.assertValidity(); J.assertValidity(); } catch (e) { fails.push('generators: ' + (e.message || e)); }
-  // 4) create -> scan round-trip (self-consistent: validates ALL the algebra/masking)
-  try {
+  const checks = [];
+  const chk = (name, fn) => { try { const d = fn(); checks.push({ name, ok: true, detail: d || '' }); } catch (e) { checks.push({ name, ok: false, detail: e.message || String(e) }); } };
+  chk('SHA-512 KAT', () => { const h = bytesToHex(sha512(new Uint8Array(0))); if (h !== 'cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e') throw new Error('mismatch'); return h.slice(0, 16) + '…'; });
+  chk('BLAKE3 KAT (empty) - libmw hash primitive', () => { const h = bytesToHex(blake3(new Uint8Array(0))); if (h !== 'af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262') throw new Error('mismatch'); return h.slice(0, 16) + '…'; });
+  chk('value generators H, J on-curve', () => { H.assertValidity(); J.assertValidity(); return 'valid'; });
+  chk('output create -> scan round-trip', () => {
     const keys = masterKeysFromSeed(sha512(new TextEncoder().encode('mweb-selftest-seed')).slice(0, 64));
     const addr = stealthAddress(keys, 3);
     const value = 123456789n;
     const out = outputCreate(addr.A, addr.B, value, fromB(sha256(new TextEncoder().encode('ks-fixed'))));
     const found = outputScan(keys, out, 10);
-    if (!found) fails.push('round-trip: scan found nothing');
-    else {
-      if (found.value !== value) fails.push('round-trip: value mismatch ' + found.value);
-      if (found.index !== 3) fails.push('round-trip: index mismatch ' + found.index);
-      // the recovered spend key must reproduce Ko = spendKey*G  (proves we can spend it)
-      if (bytesToHex(pub(mul(G, found.spendKey))) !== bytesToHex(out.Ko)) fails.push('round-trip: spendKey does not reproduce Ko');
-    }
-    // negative: a different wallet must NOT match
+    if (!found) throw new Error('scan found nothing');
+    if (found.value !== value) throw new Error('value mismatch ' + found.value);
+    if (found.index !== 3) throw new Error('index mismatch ' + found.index);
+    if (bytesToHex(pub(mul(G, found.spendKey))) !== bytesToHex(out.Ko)) throw new Error('spendKey does not reproduce Ko');   // proves we can spend it
     const other = masterKeysFromSeed(sha512(new TextEncoder().encode('other-wallet')).slice(0, 64));
-    if (outputScan(other, out, 10)) fails.push('round-trip: foreign wallet false-positive');
-  } catch (e) { fails.push('round-trip: ' + (e.message || e)); }
-  // 5) tmweb address encode -> decode round-trip (gates bech32 + convertbits + A||B order)
-  try {
+    if (outputScan(other, out, 10)) throw new Error('foreign wallet false-positive');
+    return 'recovered ' + (Number(value) / 1e8) + ' LTC at index 3';
+  });
+  chk('tmweb address encode -> decode round-trip', () => {
     const keys = masterKeysFromSeed(sha512(new TextEncoder().encode('mweb-addr-test')).slice(0, 64));
     const a = stealthAddress(keys, 7);
     const addr = encodeStealthAddress(a.Abytes, a.Bbytes, 'testnet');
-    if (!addr.startsWith('tmweb1')) fails.push('addr: wrong hrp ' + addr.slice(0, 8));
+    if (!addr.startsWith('tmweb1')) throw new Error('wrong hrp ' + addr.slice(0, 8));
     const dec = decodeStealthAddress(addr);
-    if (!dec) fails.push('addr: decode failed');
-    else if (bytesToHex(dec.scan) !== bytesToHex(a.Abytes) || bytesToHex(dec.spend) !== bytesToHex(a.Bbytes))
-      fails.push('addr: decode mismatch');
-  } catch (e) { fails.push('addr: ' + (e.message || e)); }
-  // 6) MW/Grin Schnorr sign -> verify round-trip (gates the send-side signature scheme)
-  try {
+    if (!dec) throw new Error('decode failed');
+    if (bytesToHex(dec.scan) !== bytesToHex(a.Abytes) || bytesToHex(dec.spend) !== bytesToHex(a.Bbytes)) throw new Error('decode mismatch');
+    return addr.slice(0, 14) + '…' + addr.slice(-6);
+  });
+  chk('MW-Schnorr sign -> verify (wrong msg rejected)', () => {
     const sk = fromB(sha256(new TextEncoder().encode('mweb-schnorr-test')));
     const msg = sha256(new TextEncoder().encode('msg'));
     const sig = schnorrSign(sk, msg);
-    if (sig.length !== 64) fails.push('schnorr: wrong sig length');
-    if (!schnorrVerify(sig, msg, pub(mul(G, sk)))) fails.push('schnorr: verify failed');
-    if (schnorrVerify(sig, sha256(new TextEncoder().encode('other')), pub(mul(G, sk)))) fails.push('schnorr: false-accept');
-  } catch (e) { fails.push('schnorr: ' + (e.message || e)); }
-  return { ok: fails.length === 0, fails };
+    if (sig.length !== 64) throw new Error('wrong sig length');
+    if (!schnorrVerify(sig, msg, pub(mul(G, sk)))) throw new Error('verify failed');
+    if (schnorrVerify(sig, sha256(new TextEncoder().encode('other')), pub(mul(G, sk)))) throw new Error('false-accept');
+    return 'sig ' + bytesToHex(sig).slice(0, 16) + '…';
+  });
+  const fails = checks.filter(c => !c.ok).map(c => c.name + (c.detail ? (': ' + c.detail) : ''));
+  return { ok: fails.length === 0, fails, checks };
 }
 
 export {

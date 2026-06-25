@@ -17,7 +17,7 @@ import * as bip322 from './bip322.mjs';                 // BIP-322 message signi
 import * as xmr from './monero.mjs';
 import * as xmrSeed from './monero-mnemonic.mjs';
 import * as moneroEngine from './monero-engine.mjs';   // lazy: only fetches the ~6MB bundle on first balance/send
-import * as mweb from './mweb.mjs';                     // Litecoin MWEB receive-side crypto (BLAKE3, pure-JS)
+import * as mweb from './mweb.mjs';                     // Litecoin MWEB crypto: receive + send (BLAKE3, pure-JS)
 import * as mwebNode from './mweb-node.mjs';            // MWEB data layer: Litecoin Core REST, scanned client-side
 
 /* Clickjacking guard. A frame-ancestors directive in a <meta> CSP is ignored by browsers,
@@ -486,7 +486,7 @@ function openWallet(w){
     state.ltcMweb = false; if(COINS[state.coin].addrModel === 'monero'){ state.coin = 'btc'; saveSettings(); }   // an Electrum wallet has no Monero/MWEB keys; don't strand on those views
     state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };
     state.mweb = { syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false };
-    state.xmrAccount = 0; store.activeId = w.id; saveStore(); buildAddresses(); render(); refresh(); return;
+    state.mwebSend = null; state.xmrAccount = 0; store.activeId = w.id; saveStore(); buildAddresses(); render(); refresh(); return;
   }
   state.master = HDKey.fromMasterSeed(mnemonicToSeedSync(w.mnemonic, w.passphrase || ''));
   state.addrType = (store.settings && TYPES[store.settings.addrType]) ? store.settings.addrType : (TYPES[state.addrType] ? state.addrType : 'wpkh');   // don't inherit a prior Electrum wallet's locked type
@@ -494,6 +494,7 @@ function openWallet(w){
   try { state.mwebKeys = state.mwebOk === true ? mweb.masterKeysFromMnemonic(w.mnemonic, w.passphrase || '') : null; } catch(_){ state.mwebKeys = null; }
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };   // reset Monero sync on wallet switch
   state.mweb = { syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false };   // reset MWEB scan on wallet switch
+  state.mwebSend = null;   // never carry a draft/signed send (incl. cached _hex) across a wallet switch
   state.xmrAccount = 0;
   store.activeId = w.id; saveStore();
   buildAddresses(); render(); refresh();
@@ -1892,7 +1893,10 @@ async function moneroSync(){
 const DEFAULT_MWEB_NODE = 'https://ltc-testnet-node.librenode.com';   // litecoind with -rest, behind a CORS+TLS proxy. Override in Settings.
 function mwebNodeUrl(){ return (store.settings && store.settings.mwebNode) || DEFAULT_MWEB_NODE || ''; }
 function mwebHost(){ try { return new URL(mwebNodeUrl()).host; } catch(_){ return ''; } }
-function mwebBroadcastUrl(){ return (store.settings && store.settings.mwebBroadcast) || ''; }   // the method-allowlisted sendrawtransaction proxy (read-only REST can't broadcast)
+function mwebBroadcastUrl(){   // broadcast lives at /rpc on the SAME host as the node (a method-allowlisted sendrawtransaction proxy; read-only /rest can't broadcast); derive it from the node origin
+  if(store.settings && store.settings.mwebBroadcast) return store.settings.mwebBroadcast;   // optional explicit override
+  try { return new URL(mwebNodeUrl()).origin + '/rpc'; } catch(_){ return ''; }
+}
 function fmtMwebLtc(litoshi){ const n = Number(litoshi)/1e8; return n.toFixed(8).replace(/\.?0+$/,'') || '0'; }
 const MWEB_FRESH_LOOKBACK = 1000;   // first scan covers ~1000 blocks back from tip (a recent window, like Monero's lookback); in-app wallets scan only from creation, and deeper history uses the restore-height control
 const MWEB_DATA_PREFIX = 'testnetwallet.mweb.';
@@ -1998,6 +2002,7 @@ async function mwebSync(){
     mx.balance = mwebNode.balanceOf(owned, spent);
     mx.txs = mwebTxList(owned, spent);
     mx.scannedTo = tip.height; mx.synced = true;
+    if(state.mwebSend) state.mwebSend._hex = null;   // the coin set just changed; drop any cached send tx so Send rebuilds against current UTXOs
     getPrice('LTC', state.fiat).then(p => { if(state.mweb === mx && isMweb()){ mx.price = p; render(); } }).catch(()=>{});   // LTC fiat estimate for the hero
     saveMwebData(walletId, { v:1, scannedTo:tip.height, owned:[...owned.values()], spent:[...spent] });   // persist for fast re-scan
   } catch(e){ if(e && e.name === 'AbortError') mx.error = null; else mx.error = e.message || String(e); }
@@ -2453,6 +2458,7 @@ function actWallets(editId){
         if(store.txNotes) delete store.txNotes[w.id];
         if(store.xmrLabels) delete store.xmrLabels[w.id];
         if(store.settings && store.settings.xmrRestore) delete store.settings.xmrRestore[w.id];
+        if(store.settings && store.settings.mwebRestore) delete store.settings.mwebRestore[w.id];
         deleteXmrData(w.id);                                   // purge the wallet's Monero keys+cache too
         deleteMwebData(w.id);                                  // and the MWEB scan cache
         saveStore();
@@ -3877,11 +3883,6 @@ function actSettings(){
     v=>{ store.settings = store.settings || {}; if(v) store.settings.mwebNode = v; else delete store.settings.mwebNode; saveStore(); if(state.mweb){ state.mweb.synced=false; state.mweb._autoTried=false; } },
     async base => { const t = await mwebNode.getTip(base); if(!t || !t.height) throw new Error('no chaininfo (CORS/HTTPS/-rest?)'); return 'block '+Number(t.height).toLocaleString()+(t.mwebActive?' · mweb active':' · mweb INACTIVE'); },
     DEFAULT_MWEB_NODE || '');
-  const mwebBroadcastField = () => endpointField('https://your-node/rpc  (or http://localhost:19090)',
-    ()=>(store.settings && store.settings.mwebBroadcast) || '',
-    v=>{ store.settings = store.settings || {}; if(v) store.settings.mwebBroadcast = v; else delete store.settings.mwebBroadcast; saveStore(); },
-    async base => { try { await mwebNode.testAccept(base, 'ff'); return 'endpoint reachable'; } catch(e){ const m=String(e.message||''); if(/fetch|networkerror|cors|failed to/i.test(m)) throw new Error('unreachable (CORS/URL?)'); return 'reachable (node responded)'; } },
-    '');
   const expAll = el('button',{class:'btn ghost'},'Export full backup');
   expAll.addEventListener('click', exportSnapshot);
   const impInput = el('input',{type:'file',accept:'application/json,.json',style:'display:none'});
@@ -3920,8 +3921,7 @@ function actSettings(){
       el('div',{class:'field'}, el('label',{class:'fld'},'Monero node RPC (stagenet)'), xmrNodeField('stagenet')),
       el('div',{class:'field'}, el('label',{class:'fld'},'Monero node RPC (testnet)'), xmrNodeField('testnet')),
       el('div',{class:'field'}, el('label',{class:'fld'},'Litecoin MWEB node (Core REST)'), mwebNodeField()),
-      el('div',{class:'field'}, el('label',{class:'fld'},'MWEB broadcast endpoint (for sending)'), mwebBroadcastField()),
-      el('div',{class:'sub faint',style:'margin-top:0'},'Sending needs a method-allowlisted sendrawtransaction proxy (run tools/mweb-rpc-proxy.js, or front it on the same host as the node). Receiving does not. A custom origin must also be in connect-src (index.html + _headers).'),
+      el('div',{class:'sub faint',style:'margin-top:0'},'One host serves MWEB: read-only /rest for scanning, plus (for sending) a method-allowlisted sendrawtransaction proxy at /rpc on the same origin - deploy tools/mweb-rpc-proxy.js behind /rpc. A custom origin must also be in connect-src (index.html + _headers).'),
       el('div',{class:'sub faint',style:'margin-top:0'},'Fields are prefilled with the built-in default; leave one as-is to keep using it (it updates with new releases), or enter your own Esplora instance or Monero node and press Default to revert. A custom origin must also be allowed by the page Content-Security-Policy (connect-src in _headers), which you control when self-hosting. The Monero node needs CORS (--rpc-access-control-origins), and HTTPS on an https site.'),
       el('div',{class:'sub faint'},'Privacy: each refresh reveals your addresses to the block explorer, and the fiat estimate sends the coin to the price API; both can tie those to your IP. Over Tor that stays a deanonymization surface.'),
       el('hr',{class:'hr'}),

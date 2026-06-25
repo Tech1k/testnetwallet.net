@@ -231,27 +231,31 @@ export function verify(net, address, message, sigB64){
 
 /* ---- self-test: gates the UI. KAT + sign->verify round-trip + negatives for each type ---- */
 export function selfTest(net){
-  const fails = [];
-  if(bytesToHex(messageHash('')) !== '888bab9b0d983d5058a18821fa257f99d05105d3fa0a01f162666e905c4cebc1') fails.push('messageHash("") KAT');
-  if(bytesToHex(messageHash('Hello World')) !== 'a8b6c7515051928c83e7e0ff14083c2ec67bc4ff9b8ba8db4d0155696d02aa50') fails.push('messageHash("Hello World") KAT');
+  const checks = [];
+  const chk = (name, fn) => { try { const d = fn(); checks.push({ name, ok:true, detail: d || '' }); } catch(e){ checks.push({ name, ok:false, detail: e.message || String(e) }); } };
+  chk('messageHash("") KAT', () => { const h = bytesToHex(messageHash('')); if(h !== '888bab9b0d983d5058a18821fa257f99d05105d3fa0a01f162666e905c4cebc1') throw new Error('mismatch'); return h.slice(0,16)+'…'; });
+  chk('messageHash("Hello World") KAT', () => { const h = bytesToHex(messageHash('Hello World')); if(h !== 'a8b6c7515051928c83e7e0ff14083c2ec67bc4ff9b8ba8db4d0155696d02aa50') throw new Error('mismatch'); return h.slice(0,16)+'…'; });
   const k = hexToBytes('1111111111111111111111111111111111111111111111111111111111111111');
   const pub = secp.getPublicKey(k, true);
-  const k2 = hexToBytes('2222222222222222222222222222222222222222222222222222222222222222');
-  const pub2 = secp.getPublicKey(k2, true);                          // a different key, for same-type negatives
+  const k2 = hexToBytes('2222222222222222222222222222222222222222222222222222222222222222');   // a different key, for same-type negatives
+  const pub2 = secp.getPublicKey(k2, true);
   for(const type of ['wpkh','sh-wpkh','tr']){
-    try {
+    chk(type + ' sign -> verify (wrong msg/addr/key rejected)', () => {
       const addr = addressFor(type, pub, net);
       const sig = sign(net, type, k, 'Hello World');
-      if(!verify(net, addr, 'Hello World', sig)) fails.push(type+': round-trip verify=false');
-      if(verify(net, addr, 'Tampered message', sig)) fails.push(type+': accepted wrong message');
-      if(verify(net, addressFor(type==='tr'?'wpkh':'tr', pub, net), 'Hello World', sig)) fails.push(type+': accepted wrong address');
-      if(verify(net, addressFor(type, pub2, net), 'Hello World', sig)) fails.push(type+': accepted wrong key (same type)');   // exercises key/script binding + sighash
-    } catch(e){ fails.push(type+': threw '+(e.message || e)); }
+      if(!verify(net, addr, 'Hello World', sig)) throw new Error('round-trip verify=false');
+      if(verify(net, addr, 'Tampered message', sig)) throw new Error('accepted wrong message');
+      if(verify(net, addressFor(type==='tr'?'wpkh':'tr', pub, net), 'Hello World', sig)) throw new Error('accepted wrong address');
+      if(verify(net, addressFor(type, pub2, net), 'Hello World', sig)) throw new Error('accepted wrong key (same type)');   // key/script binding + sighash
+      return addr;
+    });
   }
-  // wpkh and sh-wpkh share a 2-item witness (not separated by stack length) - the script binding + sighash must still distinguish them
-  try {
-    if(verify(net, addressFor('sh-wpkh', pub, net), 'Hello World', sign(net, 'wpkh', k, 'Hello World'))) fails.push('wpkh sig accepted for sh-wpkh address');
-    if(verify(net, addressFor('wpkh', pub, net), 'Hello World', sign(net, 'sh-wpkh', k, 'Hello World'))) fails.push('sh-wpkh sig accepted for wpkh address');
-  } catch(e){ fails.push('wpkh/sh-wpkh cross-negative threw '+(e.message || e)); }
-  return { ok: fails.length===0, fails };
+  // wpkh and sh-wpkh share a 2-item witness - the script binding + sighash must still distinguish them
+  chk('wpkh/sh-wpkh not cross-accepted', () => {
+    if(verify(net, addressFor('sh-wpkh', pub, net), 'Hello World', sign(net, 'wpkh', k, 'Hello World'))) throw new Error('wpkh sig accepted for sh-wpkh address');
+    if(verify(net, addressFor('wpkh', pub, net), 'Hello World', sign(net, 'sh-wpkh', k, 'Hello World'))) throw new Error('sh-wpkh sig accepted for wpkh address');
+    return 'distinct script + sighash';
+  });
+  const fails = checks.filter(c => !c.ok).map(c => c.name + (c.detail ? (': ' + c.detail) : ''));
+  return { ok: fails.length===0, fails, checks };
 }

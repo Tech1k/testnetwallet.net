@@ -36,7 +36,7 @@ http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   if (req.method !== 'POST') return reply(res, 405, { error: { message: 'POST only' } });
   let body = '';
-  req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
+  req.on('data', (c) => { body += c; if (body.length > 1e6) { req.destroy(); return; } });
   req.on('end', () => {
     let method, params;
     try {

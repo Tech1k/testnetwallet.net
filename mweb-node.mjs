@@ -124,7 +124,7 @@ async function rpcPost(endpoint, method, params, signal) {
       body: JSON.stringify({ method, params }),
     });
     const txt = await res.text();
-    let j; try { j = JSON.parse(txt); } catch (_) { throw new Error('non-JSON from broadcast endpoint (HTTP ' + res.status + ')'); }
+    let j; try { j = JSON.parse(txt); } catch (_) { throw new Error('broadcast endpoint returned HTTP ' + res.status + ' (no sendrawtransaction proxy reachable here - deploy tools/mweb-rpc-proxy.js behind /rpc on the node)'); }
     if (j.error) throw new Error((j.error.message || JSON.stringify(j.error)));
     return j.result;
   } finally {

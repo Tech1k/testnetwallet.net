@@ -48,4 +48,4 @@ emcc -O3 \
   -s "EXPORTED_RUNTIME_METHODS=['ccall','setValue','getValue','HEAPU8']" \
   -o "$OUT"
 
-echo "Built $OUT ($(wc -c < "$OUT") bytes). Lazy-load it from mweb-tx.mjs; see README."
+echo "Built $OUT ($(wc -c < "$OUT") bytes). Lazy-load it from mweb.mjs; see README."
