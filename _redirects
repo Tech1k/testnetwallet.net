@@ -9,5 +9,3 @@
 # noble-sha512 dep), which is now wired into the wallet.
 
 /tools/*                    /  302
-/mweb-test.html             /  302
-/mweb-test.js               /  302

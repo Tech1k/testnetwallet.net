@@ -8,6 +8,7 @@ import * as btc from './vendor/btc-signer.mjs';
 import * as bip322 from './bip322.mjs';
 import * as xmr from './monero.mjs';
 import * as xmrSeed from './monero-mnemonic.mjs';
+import * as mweb from './mweb.mjs';
 
 const results = document.getElementById('results');
 let pass = 0, fail = 0;
@@ -33,6 +34,8 @@ function groupSelfTests(){
   catch(e){ row(g, false, 'Monero key derivation', String(e)); }
   try { const r = xmrSeed.selfTest(); row(g, !!r.ok, 'Monero 25-word portable seed', r.ok?'pass':JSON.stringify(r.fails)); }
   catch(e){ row(g, false, 'Monero 25-word seed', String(e)); }
+  try { const r = mweb.selfTest(); row(g, !!r.ok, 'Litecoin MWEB crypto (scan + tmweb address + Schnorr)', r.ok?'pass':JSON.stringify(r.fails)); }
+  catch(e){ row(g, false, 'Litecoin MWEB crypto', String(e)); }
 }
 
 // ---------- 2. BIP39 seed + BIP44/49/84/86 address KATs (mainnet published vectors) ----------

@@ -1293,7 +1293,8 @@ function renderMoneroSend(){
       const amtIn = el('input',{type:'number',min:'0',step:'0.000000000001',value:r.amount,placeholder:'amount XMR',style:'max-width:160px'});
       amtIn.addEventListener('input', e=>{ r.amount = e.target.value; });
       const rm = ms.recipients.length>1 ? el('button',{class:'btn ghost sm',title:'Remove',onclick:()=>{ ms.recipients.splice(i,1); renderRows(); }},'✕') : null;
-      rows.append(el('div',{class:'field'}, el('label',{class:'fld'}, 'Recipient '+(i+1)), el('div',{class:'row'}, toIn, amtIn, rm)));
+      const scan = el('button',{class:'btn ghost sm',title:'Scan a QR code',onclick:()=>scanModal(text=>{ const u=parseMoneroUri(text); r.to = (u && u.address) ? u.address : String(text).trim(); if(u && u.amount) r.amount=u.amount; renderRows(); })},'Scan');
+      rows.append(el('div',{class:'field'}, el('label',{class:'fld'}, 'Recipient '+(i+1)), el('div',{class:'row'}, toIn, amtIn, scan, rm)));
     });
   };
   renderRows();
@@ -2120,6 +2121,7 @@ function renderMwebSend(){
   const msg = el('div',{});
   const clearHex = ()=>{ s._hex=null; };
   const toIn = el('input',{type:'text',placeholder:'tmweb1… or a Litecoin testnet address',value:s.to}); toIn.addEventListener('input', e=>{ s.to=e.target.value; clearHex(); });
+  const scanBtn = el('button',{class:'btn ghost sm',title:'Scan a QR code',onclick:()=>scanModal(text=>{ const p=parseBip21(text); s.to = (p && p.address) ? p.address : String(text).trim(); s._hex=null; render(); })},'Scan');
   const amtIn = el('input',{type:'text',inputmode:'decimal',placeholder:'amount in LTC',value:s.amount}); amtIn.addEventListener('input', e=>{ s.amount=e.target.value; clearHex(); });
   const feeIn = el('input',{type:'number',min:'0',step:'1',style:'max-width:150px',value:s.fee}); feeIn.addEventListener('input', e=>{ s.fee=e.target.value; clearHex(); });
   async function build(){
@@ -2167,7 +2169,7 @@ function renderMwebSend(){
   return el('div',{class:'card'},
     el('div',{class:'card-h'}, 'Send MWEB', el('span',{class:'sub'}, fmtMwebLtc(total) + ' LTC spendable · testnet')),
     el('div',{class:'card-b stack'},
-      el('div',{class:'field'}, el('label',{class:'fld'},'To (tmweb, or a Litecoin address to peg-out)'), toIn),
+      el('div',{class:'field'}, el('label',{class:'fld'},'To (tmweb, or a Litecoin address to peg-out)'), el('div',{class:'row',style:'align-items:center'}, toIn, scanBtn)),
       el('div',{class:'field'}, el('label',{class:'fld'},'Amount (LTC)'), amtIn),
       el('div',{class:'field'}, el('label',{class:'fld'},'Fee (litoshi)'), feeIn),
       el('div',{class:'sub faint'},'Send to a tmweb address to stay private, or to a regular Litecoin testnet address to peg-out (the node settles that to a transparent output). A 64-bit range proof is built in your browser (a small prover loads once), then broadcast through your node. Always Check (dry-run) first. Sending is new, so verify on testnet.'),
