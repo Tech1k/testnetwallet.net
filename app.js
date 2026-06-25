@@ -1890,13 +1890,10 @@ async function moneroSync(){
 }
 
 /* ----------------------------- Litecoin MWEB (receive-side scan via Core REST, no engine) ----------------------------- */
-const DEFAULT_MWEB_NODE = 'https://ltc-testnet-node.librenode.com';   // litecoind with -rest, behind a CORS+TLS proxy. Override in Settings.
+const DEFAULT_MWEB_NODE = 'https://ltc-testnet-node.librenode.com/mweb.php';   // the single-file MWEB helper (tools/mweb.php) fronting a localhost litecoind: scan (GET) + broadcast (POST). Override in Settings.
 function mwebNodeUrl(){ return (store.settings && store.settings.mwebNode) || DEFAULT_MWEB_NODE || ''; }
 function mwebHost(){ try { return new URL(mwebNodeUrl()).host; } catch(_){ return ''; } }
-function mwebBroadcastUrl(){   // broadcast lives at /rpc on the SAME host as the node (a method-allowlisted sendrawtransaction proxy; read-only /rest can't broadcast); derive it from the node origin
-  if(store.settings && store.settings.mwebBroadcast) return store.settings.mwebBroadcast;   // optional explicit override
-  try { return new URL(mwebNodeUrl()).origin + '/rpc'; } catch(_){ return ''; }
-}
+function mwebBroadcastUrl(){ return (store.settings && store.settings.mwebBroadcast) || mwebNodeUrl(); }   // the mweb.php helper serves both scanning (GET) and broadcast (POST) at one URL
 function fmtMwebLtc(litoshi){ const n = Number(litoshi)/1e8; return n.toFixed(8).replace(/\.?0+$/,'') || '0'; }
 const MWEB_FRESH_LOOKBACK = 1000;   // first scan covers ~1000 blocks back from tip (a recent window, like Monero's lookback); in-app wallets scan only from creation, and deeper history uses the restore-height control
 const MWEB_DATA_PREFIX = 'testnetwallet.mweb.';
@@ -2120,30 +2117,49 @@ function renderMwebSend(){
   if(!mx.synced) return el('div',{class:'card'}, el('div',{class:'card-b'}, el('div',{class:'sub'}, mx.syncing ? 'Scanning…' : 'Connect and scan on the balance screen before sending.')));
   const spendable = []; if(mx.owned) for(const [id,u] of mx.owned) if(!mx.spent || !mx.spent.has(id)) spendable.push(u);
   const total = spendable.reduce((a,u)=>a+BigInt(u.value), 0n);
-  const s = state.mwebSend = state.mwebSend || { to:'', amount:'', fee:'10000' };
+  const s = state.mwebSend = state.mwebSend || { to:'', amount:'' };
+  // MWEB fees are DETERMINISTIC: fee = mweb_weight * BASE_MWEB_FEE (100 litoshi/weight unit). Weights (libmw):
+  // standard input 0, standard output 18, stealth kernel 3, + ceil(pegoutScript/42). A pure MWEB tx has no
+  // canonical size, so the node's min-relay floor and max-fee ceiling are BOTH exactly weight*100 - the node
+  // accepts that one value and nothing else (no rate market). So we compute it; there's nothing to tune.
+  const mwebTxFee = (mwebOuts, pegoutLen=0) => {
+    const weight = BigInt(mwebOuts)*18n + 3n + (pegoutLen ? BigInt(Math.ceil(pegoutLen/42)) : 0n);
+    return { weight, fee: weight*100n };
+  };
   const broadcastUrl = mwebBroadcastUrl();
   const toLitoshi = (str)=>{ const t=String(str).trim(); if(t===''||t==='.'||!/^\d*\.?\d*$/.test(t)) return null; const [i,f='']=t.split('.'); if(f.length>8) return null; return BigInt(i||'0')*100000000n + BigInt((f+'00000000').slice(0,8)); };
   const msg = el('div',{});
   const clearHex = ()=>{ s._hex=null; };
-  const toIn = el('input',{type:'text',placeholder:'tmweb1… or a Litecoin testnet address',value:s.to}); toIn.addEventListener('input', e=>{ s.to=e.target.value; clearHex(); });
+  const toIn = el('input',{type:'text',placeholder:'tmweb1… or a Litecoin testnet address',value:s.to}); toIn.addEventListener('input', e=>{ s.to=e.target.value; clearHex(); updateFeeNote(); });
   const scanBtn = el('button',{class:'btn ghost sm',title:'Scan a QR code',onclick:()=>scanModal(text=>{ const p=parseBip21(text); s.to = (p && p.address) ? p.address : String(text).trim(); s._hex=null; render(); })},'Scan');
   const amtIn = el('input',{type:'text',inputmode:'decimal',placeholder:'amount in LTC',value:s.amount}); amtIn.addEventListener('input', e=>{ s.amount=e.target.value; clearHex(); });
-  const feeIn = el('input',{type:'number',min:'0',step:'1',style:'max-width:150px',value:s.fee}); feeIn.addEventListener('input', e=>{ s.fee=e.target.value; clearHex(); });
+  const feeNote = el('div',{class:'sub'});
+  function updateFeeNote(){
+    const toStr=(s.to||'').trim(); const dst=mweb.decodeStealthAddress(toStr);
+    const isPeg = !dst && isValidAddress(toStr,'ltc');
+    let pegLen=0; if(isPeg){ try{ pegLen=btc.OutScript.encode(btc.Address(COINS.ltc.net).decode(toStr)).length; }catch(_){ pegLen=25; } }
+    const { weight, fee } = mwebTxFee((isPeg?0:1)+1, pegLen);
+    clear(feeNote).append(el('span',{class:'mono'}, fmtMwebLtc(fee) + ' LTC'), ' (' + fee + ' litoshi), set automatically. MWEB fees are fixed by weight (' + weight + ' x 100 litoshi), not a rate you tune.');
+  }
   async function build(){
-    const amt = toLitoshi(s.amount), fee = BigInt(parseInt(s.fee,10)||0);
+    const amt = toLitoshi(s.amount);
     if(amt==null || amt<=0n) throw new Error('Enter a valid amount.');
     const toStr = (s.to||'').trim();
     const dest = mweb.decodeStealthAddress(toStr);
-    let recipient;
+    let recipient, pegLen = 0, isPeg = false;
     if(dest) recipient = { address: dest, value: amt };                                  // MWEB -> MWEB
-    else if(isValidAddress(toStr, 'ltc')) recipient = { script: btc.OutScript.encode(btc.Address(COINS.ltc.net).decode(toStr)), value: amt };   // MWEB -> transparent (peg-out)
+    else if(isValidAddress(toStr, 'ltc')){ const script = btc.OutScript.encode(btc.Address(COINS.ltc.net).decode(toStr)); pegLen = script.length; isPeg = true; recipient = { script, value: amt }; }   // peg-out
     else throw new Error('Enter a valid tmweb or Litecoin testnet address.');
+    // MWEB fee is deterministic (weight x 100); assume a change output, recompute without it if coins come out exact.
+    const feeFor = (withChange) => mwebTxFee((isPeg ? 0 : 1) + (withChange ? 1 : 0), pegLen).fee;
+    let fee = feeFor(true);
     if(amt+fee > total) throw new Error('Insufficient MWEB balance (' + fmtMwebLtc(total) + ' LTC spendable).');
     const sorted = spendable.slice().sort((a,b)=> (BigInt(a.value) < BigInt(b.value) ? -1 : 1));   // smallest-first selection
     const sel=[]; let acc=0n; for(const u of sorted){ sel.push(u); acc+=BigInt(u.value); if(acc>=amt+fee) break; }
     if(acc < amt+fee) throw new Error('Could not select enough coins.');
+    let change = acc - amt - fee;
+    if(change <= 0n){ fee = feeFor(false); change = acc - amt - fee; if(change < 0n) throw new Error('Insufficient MWEB balance for amount + fee.'); }
     const recipients = [recipient];
-    const change = acc - amt - fee;
     if(change > 0n){ const ch = mweb.stealthAddress(state.mwebKeys, 0); recipients.push({ address:{ scan:ch.Abytes, spend:ch.Bbytes }, value: change }); }   // change always stays in MWEB (our index-0 address)
     const coins = sel.map(u=>({ output_id:u.output_id, value:u.value, blind:u.blind, spendKey:u.spendKey }));
     return mweb.buildTransaction({ coins, recipients, fee });
@@ -2171,14 +2187,15 @@ function renderMwebSend(){
       finally { sendBtn.disabled=false; }
     }, { yes:'Send' });
   });
+  updateFeeNote();
   return el('div',{class:'card'},
     el('div',{class:'card-h'}, 'Send MWEB', el('span',{class:'sub'}, fmtMwebLtc(total) + ' LTC spendable · testnet')),
     el('div',{class:'card-b stack'},
       el('div',{class:'field'}, el('label',{class:'fld'},'To (tmweb, or a Litecoin address to peg-out)'), el('div',{class:'row',style:'align-items:center'}, toIn, scanBtn)),
       el('div',{class:'field'}, el('label',{class:'fld'},'Amount (LTC)'), amtIn),
-      el('div',{class:'field'}, el('label',{class:'fld'},'Fee (litoshi)'), feeIn),
+      el('div',{class:'field'}, el('label',{class:'fld'},'Network fee'), feeNote),
       el('div',{class:'sub faint'},'Send to a tmweb address to stay private, or to a regular Litecoin testnet address to peg-out (the node settles that to a transparent output). A 64-bit range proof is built in your browser (a small prover loads once), then broadcast through your node. Always Check (dry-run) first. Sending is new, so verify on testnet.'),
-      broadcastUrl ? null : el('div',{class:'msg warn'},'Set an MWEB broadcast endpoint in Settings (run tools/mweb-rpc-proxy.js) to enable sending.'),
+      broadcastUrl ? null : el('div',{class:'msg warn'},'Set a Litecoin MWEB helper in Settings (deploy tools/mweb.php) to enable sending.'),
       el('div',{class:'row',style:'flex:0'}, dryBtn, sendBtn),
       msg,
     ));
@@ -3920,8 +3937,8 @@ function actSettings(){
       el('div',{class:'field'}, el('label',{class:'fld'},'Litecoin Esplora API'), apiField('ltc')),
       el('div',{class:'field'}, el('label',{class:'fld'},'Monero node RPC (stagenet)'), xmrNodeField('stagenet')),
       el('div',{class:'field'}, el('label',{class:'fld'},'Monero node RPC (testnet)'), xmrNodeField('testnet')),
-      el('div',{class:'field'}, el('label',{class:'fld'},'Litecoin MWEB node (Core REST)'), mwebNodeField()),
-      el('div',{class:'sub faint',style:'margin-top:0'},'One host serves MWEB: read-only /rest for scanning, plus (for sending) a method-allowlisted sendrawtransaction proxy at /rpc on the same origin - deploy tools/mweb-rpc-proxy.js behind /rpc. A custom origin must also be in connect-src (index.html + _headers).'),
+      el('div',{class:'field'}, el('label',{class:'fld'},'Litecoin MWEB helper (mweb.php)'), mwebNodeField()),
+      el('div',{class:'sub faint',style:'margin-top:0'},'A single drop-in PHP helper (tools/mweb.php) on the same host as your litecoind: it serves MWEB outputs by height range for scanning (your browser scans them locally) and broadcasts your signed sends. litecoind stays localhost-only. A custom origin must also be in connect-src (index.html + _headers).'),
       el('div',{class:'sub faint',style:'margin-top:0'},'Fields are prefilled with the built-in default; leave one as-is to keep using it (it updates with new releases), or enter your own Esplora instance or Monero node and press Default to revert. A custom origin must also be allowed by the page Content-Security-Policy (connect-src in _headers), which you control when self-hosting. The Monero node needs CORS (--rpc-access-control-origins), and HTTPS on an https site.'),
       el('div',{class:'sub faint'},'Privacy: each refresh reveals your addresses to the block explorer, and the fiat estimate sends the coin to the price API; both can tie those to your IP. Over Tor that stays a deanonymization surface.'),
       el('hr',{class:'hr'}),

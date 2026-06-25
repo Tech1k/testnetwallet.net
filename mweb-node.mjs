@@ -1,43 +1,34 @@
 /* ============================================================================
- * mweb-node.mjs - Litecoin Core REST data layer for MWEB receive-side scanning.
+ * mweb-node.mjs - data layer for the single-file MWEB helper (tools/mweb.php).
  *
- * Talks to a litecoind exposing the read-only REST interface (-rest=1), fronted
- * by a CORS+TLS reverse proxy. No third-party indexer and no light-wallet
- * server: blocks come straight from the node, every output is scanned locally
- * in mweb.mjs, and keys never leave the browser. This is the HTTP/browser
- * counterpart to mwebd (which is P2P and not reachable from a web page).
+ * The wallet talks ONLY to the helper, on one origin:
+ *   GET  <helper>?tip            -> tip height + mweb-active
+ *   GET  <helper>?from=H&to=H2   -> the MWEB outputs/inputs in that height range
+ *   POST <helper>  {method,...}  -> broadcast (sendrawtransaction / testmempoolaccept)
  *
- * Endpoints used (all read-only GETs):
- *   /rest/chaininfo.json                 -> tip height, best hash, mweb active
- *   /rest/blockhashbyheight/<height>.json-> { blockhash }
- *   /rest/block/<hash>.json              -> full block incl. .mweb {outputs,inputs,...}
+ * The helper fronts litecoind over localhost; keys never leave the browser, and it
+ * serves outputs BY HEIGHT RANGE - the browser scans them locally (mweb.mjs), so the
+ * helper never learns which outputs are yours. This replaces the old read-only /rest
+ * CORS proxy AND the separate broadcast proxy with one drop-in file.
  * ========================================================================== */
 import * as mweb from './mweb.mjs';
 
-const REQ_TIMEOUT = 20000;     // per-request abort (ms)
-const SCAN_CONCURRENCY = 16;   // blocks fetched in parallel per batch (multiplexes over HTTP/2 to the node)
+const REQ_TIMEOUT = 30000;   // per-request abort (ms); a range scan loops blocks server-side
+const SCAN_CHUNK = 500;      // heights per scan request (the helper also caps server-side)
 
-// Normalize a node URL to its origin (tolerate a trailing slash or /rest).
-function base(url) { return String(url || '').trim().replace(/\/+$/, '').replace(/\/rest$/, ''); }
+function url(node) { return String(node || '').trim().replace(/\/+$/, ''); }
 
-async function jget(url, signal) {
+async function jget(u, signal) {
   const ctl = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, REQ_TIMEOUT);
+  const timer = setTimeout(() => ctl.abort(), REQ_TIMEOUT);
   const onAbort = () => ctl.abort();
   if (signal) { if (signal.aborted) ctl.abort(); else signal.addEventListener('abort', onAbort); }
   try {
-    const res = await fetch(url, { signal: ctl.signal, headers: { accept: 'application/json' } });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const ct = res.headers.get('content-type') || '';
-    if (!ct.includes('json')) throw new Error('unexpected content-type: ' + ct);
-    return await res.json();
-  } catch (e) {
-    // A timeout fires ctl.abort() too, which would otherwise be an indistinguishable AbortError that
-    // the sync driver treats as a deliberate user-cancel (silent). Re-throw it as a normal error so it
-    // surfaces; only a genuine external signal abort stays an AbortError.
-    if (timedOut) throw new Error('request timed out (' + REQ_TIMEOUT + 'ms): ' + url);
-    throw e;
+    const res = await fetch(u, { signal: ctl.signal, headers: { accept: 'application/json' } });
+    const txt = await res.text();
+    let j; try { j = JSON.parse(txt); } catch (_) { throw new Error('MWEB helper returned HTTP ' + res.status + ' (is this the mweb.php URL?)'); }
+    if (j && j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+    return j;
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener('abort', onAbort);
@@ -45,54 +36,24 @@ async function jget(url, signal) {
 }
 
 export async function getTip(node, signal) {
-  const j = await jget(base(node) + '/rest/chaininfo.json', signal);
-  return {
-    height: j.blocks,
-    hash: j.bestblockhash,
-    chain: j.chain,
-    ibd: !!j.initialblockdownload,
-    mwebActive: !!(j.softforks && j.softforks.mweb && j.softforks.mweb.active),
-  };
-}
-export async function getBlockHash(node, height, signal) {
-  const j = await jget(base(node) + '/rest/blockhashbyheight/' + height + '.json', signal);
-  return j.blockhash;
-}
-export async function getBlock(node, hash, signal) {
-  return jget(base(node) + '/rest/block/' + hash + '.json', signal);
-}
-async function getBlockAt(node, height, signal) {
-  return getBlock(node, await getBlockHash(node, height, signal), signal);
+  const j = await jget(url(node) + '?tip', signal);
+  return { height: j.height, hash: j.hash, chain: j.chain, mwebActive: !!j.mwebActive };
 }
 
-// Cheap health probe (chaininfo only, no scanning).
-export async function probe(node, signal) {
-  try { return { ok: true, ...(await getTip(node, signal)) }; }
-  catch (e) { return { ok: false, error: e.message || String(e) }; }
-}
-
-// Scan heights [fromH, toH] inclusive. Seeds from (and mutates) opts.owned / opts.spent
-// so callers can resume from a cache. onProgress(height, ownedCount) fires per batch.
+// Scan heights [fromH, toH] inclusive, in chunks. Seeds from (and mutates) opts.owned / opts.spent
+// so callers can resume from a cache. onProgress(height, ownedCount) fires per chunk.
 // Throws AbortError if opts.signal aborts. Returns { owned, spent, lastHeight }.
 export async function scanRange(node, keys, fromH, toH, opts = {}) {
   const { gap = 50, onProgress, signal, owned = new Map(), spent = new Set() } = opts;
-  for (let start = fromH; start <= toH; start += SCAN_CONCURRENCY) {
+  for (let start = fromH; start <= toH; start += SCAN_CHUNK) {
     if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-    const end = Math.min(start + SCAN_CONCURRENCY - 1, toH);
-    const heights = [];
-    for (let h = start; h <= end; h++) heights.push(h);
-    const blocks = await Promise.all(heights.map((h) => getBlockAt(node, h, signal)));
-    for (let i = 0; i < blocks.length; i++) {
-      const h = heights[i];
-      const mw = blocks[i] && blocks[i].mweb;
-      if (!mw) continue;
-      const found = mweb.scanBlockOutputs(keys, mw.outputs, gap);
-      for (const u of found) { u.height = h; owned.set(u.output_id, u); }
-      // Spend detection: an MWEB input references the spent output by its output_id, and `owned` is
-      // keyed by output_id. Confirmed vs litecoin src/rpc/blockchain.cpp (objInput.pushKV("output_id",..))
-      // and libmw Input.h (m_outputID). REST gives inputs as objects here; tolerate the compact
-      // bare-hash-string form too.
-      if (mw.inputs) for (const inp of mw.inputs) {
+    const end = Math.min(start + SCAN_CHUNK - 1, toH);
+    const data = await jget(url(node) + '?from=' + start + '&to=' + end, signal);
+    for (const blk of (data.blocks || [])) {
+      const found = mweb.scanBlockOutputs(keys, blk.outputs, gap);
+      for (const u of found) { u.height = blk.height; owned.set(u.output_id, u); }
+      // spend detection: an MWEB input references the spent output by output_id (owned is keyed by it).
+      if (blk.inputs) for (const inp of blk.inputs) {
         const ref = (typeof inp === 'string') ? inp : (inp && inp.output_id);
         if (ref && owned.has(ref)) spent.add(ref);
       }
@@ -109,23 +70,21 @@ export function balanceOf(owned, spent) {
   return bal;
 }
 
-/* ---------------- broadcast (the one write path) ----------------
- * POSTs a JSON-RPC call to the method-allowlisted proxy (tools/mweb-rpc-proxy.js), which forwards
- * only sendrawtransaction / testmempoolaccept to litecoind. Returns litecoind's JSON-RPC result. */
-async function rpcPost(endpoint, method, params, signal) {
+/* ---------------- broadcast (POST to the same helper) ---------------- */
+async function rpcPost(node, method, params, signal) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), REQ_TIMEOUT);
   const onAbort = () => ctl.abort();
   if (signal) { if (signal.aborted) ctl.abort(); else signal.addEventListener('abort', onAbort); }
   try {
-    const res = await fetch(endpoint, {
+    const res = await fetch(url(node), {
       method: 'POST', signal: ctl.signal,
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ method, params }),
     });
     const txt = await res.text();
-    let j; try { j = JSON.parse(txt); } catch (_) { throw new Error('broadcast endpoint returned HTTP ' + res.status + ' (no sendrawtransaction proxy reachable here - deploy tools/mweb-rpc-proxy.js behind /rpc on the node)'); }
-    if (j.error) throw new Error((j.error.message || JSON.stringify(j.error)));
+    let j; try { j = JSON.parse(txt); } catch (_) { throw new Error('MWEB helper returned HTTP ' + res.status + ' (POST not handled - is mweb.php deployed?)'); }
+    if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
     return j.result;
   } finally {
     clearTimeout(timer);
@@ -134,12 +93,12 @@ async function rpcPost(endpoint, method, params, signal) {
 }
 
 // Dry-run: ask the node whether it WOULD accept the tx (no broadcast). Returns { txid, allowed, ... }.
-export async function testAccept(endpoint, rawHex, signal) {
-  const r = await rpcPost(endpoint, 'testmempoolaccept', [[rawHex]], signal);
+export async function testAccept(node, rawHex, signal) {
+  const r = await rpcPost(node, 'testmempoolaccept', [[rawHex]], signal);
   return Array.isArray(r) ? r[0] : r;
 }
 
 // Broadcast the extended MWEB raw-tx hex. Returns the txid on success, throws the node's reason on failure.
-export async function broadcast(endpoint, rawHex, signal) {
-  return rpcPost(endpoint, 'sendrawtransaction', [rawHex], signal);
+export async function broadcast(node, rawHex, signal) {
+  return rpcPost(node, 'sendrawtransaction', [rawHex], signal);
 }

@@ -69,10 +69,12 @@ const xorBytes = (a, b, off=0, len=a.length) => { const o = a.slice(); for (let 
 const htag = (tagChar, ...parts) => blake3(concatBytes(Uint8Array.of(tagChar.charCodeAt(0)), ...parts));
 const htagScalar = (tagChar, ...parts) => sc(fromB(htag(tagChar, ...parts)));   // hash as a scalar mod n
 
-// 33-byte Pedersen-commitment serialization: prefix 0x08|0x09 (y parity) then X (BE).
+// 33-byte Pedersen-commitment serialization (secp256k1_pedersen_commitment_serialize):
+// prefix 0x08 if Y is a quadratic residue, else 0x09, then X (BE). This is the QR of Y, NOT
+// pubkey parity (0x02/0x03) - Pedersen commitments and pubkeys use different sign conventions.
 function commitBytes(point) {
   const a = point.toAffine();
-  return concatBytes(Uint8Array.of(0x08 | (a.y & 1n ? 1 : 0)), numberToBytesBE(a.x, 32));
+  return concatBytes(Uint8Array.of(isQuad(a.y) ? 0x08 : 0x09), numberToBytesBE(a.x, 32));
 }
 
 /* ---------------- Pedersen commit + blind switch ---------------- */
@@ -325,8 +327,14 @@ function compactSize(n) {
   return Uint8Array.of(0xfe, n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff);
 }
 const u32leB = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0, true); return b; };
-// 33-byte Pedersen commitment (0x08|0x09) -> 33-byte secp pubkey (0x02|0x03), same point.
-function commitmentToPubkey(commit33) { const o = commit33.slice(); o[0] = 0x02 | (commit33[0] & 1); return o; }
+// 33-byte Pedersen commitment (0x08/0x09, QR convention) -> 33-byte secp pubkey (0x02/0x03, Y parity), same point.
+function commitmentToPubkey(commit33) {
+  const x = bytesToNumberBE(commit33.slice(1));
+  let y = modpow((x * x * x + 7n) % FIELD_P, (FIELD_P + 1n) / 4n, FIELD_P);   // a square root of x^3 + 7 (p == 3 mod 4)
+  if (!isQuad(y)) y = FIELD_P - y;                  // set_xquad: the quadratic-residue root
+  if (commit33[0] & 1) y = FIELD_P - y;             // prefix 0x09 -> non-QR root (negate)
+  return concatBytes(Uint8Array.of(0x02 | Number(y & 1n)), numberToBytesBE(x, 32));
+}
 function byteCmp(a, b) { for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return a[i] - b[i]; } return 0; }
 
 /* ---- MW/Grin pre-BIP340 Schnorr (secp256k1-zkp bip-schnorr/aggsig) ----
@@ -397,16 +405,19 @@ async function buildSendOutput(scanPub, spendPub, value, ksScalar) {
 function buildInput(coin) {
   const value = BigInt(coin.value);
   const switchBlind = blindSwitch(fromB(hexToBytes(coin.blind)), value);
-  const k_o = fromB(hexToBytes(coin.spendKey));                    // output one-time spend key (b_i*H('O',t))
-  const k_i = fromB(secp.utils.randomPrivateKey());               // ephemeral input key
-  const Ki = pub(mul(G, k_i)), Ko = pub(mul(G, k_o));
+  const k_o = fromB(hexToBytes(coin.spendKey));                    // output one-time spend key (b_i*H('O',t)) = output_key
+  const k_i = fromB(secp.utils.randomPrivateKey());               // ephemeral input key = input_key
+  const Ki = pub(mul(G, k_i)), Ko = pub(mul(G, k_o));             // input_pubkey, output_pubkey
   const keyHash = sc(fromB(hashNoTag(Ki, Ko)));                    // key_hash = BLAKE3(K_i||K_o) as a scalar
-  const sigKey = scAdd(k_i, scMul(keyHash, k_o));                  // sig_key = k_i + key_hash*k_o
+  const sigKey = scAdd(k_i, scMul(keyHash, k_o));                  // sig_key = k_i + key_hash*k_o (Input::Create)
   const outputId = hexToBytes(coin.output_id);
-  const signature = schnorrSign(sigKey, outputId);                // signed over the spent output_id (32B)
+  const features = 0x01;                                           // STEALTH_KEY_FEATURE_BIT (standard input)
+  const sigMsg = hashNoTag(Uint8Array.of(features), outputId);     // msg = BLAKE3(features || output_id)
+  const signature = schnorrSign(sigKey, sigMsg);
   const commitment = commitBytes(pedersen(value, switchBlind));    // Commitment::Blinded(switchBlind, value)
-  const serialized = concatBytes(outputId, commitment, Ki, Ko, signature);
-  return { outputId, serialized, switchBlind, totalKey: scAdd(k_i, sc(N - k_o)) };   // totalKey = k_i - k_o
+  // libmw Input wire order: features || output_id || commitment || output_pubkey(Ko) || input_pubkey(Ki) || signature
+  const serialized = concatBytes(Uint8Array.of(features), outputId, commitment, Ko, Ki, signature);
+  return { outputId, serialized, switchBlind, totalKey: scAdd(k_i, sc(N - k_o)) };   // stealth-offset contribution k_i - k_o (TxBuilder keys.Add(k_i).Sub(k_o); StealthSumValidator)
 }
 
 /* ---- PegOutCoin: a transparent destination (MWEB -> regular LTC address) ---- */
@@ -417,9 +428,11 @@ function serializePegOut(p) {   // WriteVarInt(amount) || CScript (compactSize-p
 function buildKernel(kernelBlind, stealthBlind, fee, pegouts) {
   pegouts = pegouts || [];
   const features = 0x01 | (pegouts.length ? 0x04 : 0x00) | 0x10;   // FEE | [PEGOUT] | STEALTH_EXCESS
-  const excess = commitBytes(pedersen(0n, kernelBlind));          // Commitment::Blinded(kernelBlind, 0) = kernelBlind*G
+  const excessPt = pedersen(0n, kernelBlind);                    // Commitment::Blinded(kernelBlind, 0) = kernelBlind*G
+  const excess = commitBytes(excessPt);
   const stealthExcess = pub(mul(G, stealthBlind));
-  const h = sc(fromB(hashNoTag(commitmentToPubkey(excess), stealthExcess)));
+  // h = BLAKE3(PublicKey::From(excess) || stealth_excess); PublicKey::From = parity-compressed excess point = pub(excessPt)
+  const h = sc(fromB(hashNoTag(pub(excessPt), stealthExcess)));
   const sigKey = scAdd(scMul(kernelBlind, h), stealthBlind);
   const feeV = writeVarInt(fee);
   const pegBytes = pegouts.length ? concatBytes(compactSize(pegouts.length), ...pegouts.map(serializePegOut)) : new Uint8Array(0);
@@ -437,6 +450,10 @@ function buildKernel(kernelBlind, stealthBlind, fee, pegouts) {
 async function buildTransaction({ coins, recipients, fee }) {
   if (!coins || !coins.length) throw new Error('no inputs selected');
   if (!recipients || !recipients.length) throw new Error('no recipients');
+  // value invariant (KernelSumValidator H-axis): Sum(in) must equal Sum(recipients incl. change + pegouts) + fee,
+  // or the node rejects an otherwise-valid tx as "bad-mweb-txn". Surface a clear error instead of that.
+  const vIn = coins.reduce((a, c) => a + BigInt(c.value), 0n), vOut = recipients.reduce((a, r) => a + BigInt(r.value), 0n);
+  if (vIn !== vOut + BigInt(fee)) throw new Error('MWEB value imbalance: inputs ' + vIn + ' != recipients ' + vOut + ' + fee ' + BigInt(fee) + ' (coin selection/change is off; node would reject as bad-mweb-txn)');
   const inputs = coins.map(buildInput);
   const outs = [], pegouts = [];
   for (const r of recipients) {
@@ -453,7 +470,7 @@ async function buildTransaction({ coins, recipients, fee }) {
   let sob = 0n; for (const o of outs) sob = scAdd(sob, o.switchBlind);
   let sib = 0n; for (const i of inputs) sib = scAdd(sib, i.switchBlind);
   const kernelBlind = scAdd(sob, scAdd(sc(N - sib), sc(N - kernelOffset)));
-  // stealth (owner) balance: stealth_offset = Sum(out ks) + Sum(in k_i - k_o) - stealth_blind
+  // stealth (owner) balance: stealth_offset = Sum(out ks) + Sum(in k_i - k_o) - stealth_blind  (StealthSumValidator)
   const stealthBlind = fromB(secp.utils.randomPrivateKey());
   let sok = 0n; for (const o of outs) sok = scAdd(sok, o.ks);
   let sik = 0n; for (const i of inputs) sik = scAdd(sik, i.totalKey);
@@ -512,6 +529,21 @@ function selfTest() {
     if (!schnorrVerify(sig, msg, pub(mul(G, sk)))) throw new Error('verify failed');
     if (schnorrVerify(sig, sha256(new TextEncoder().encode('other')), pub(mul(G, sk)))) throw new Error('false-accept');
     return 'sig ' + bytesToHex(sig).slice(0, 16) + '…';
+  });
+  chk('MWEB input: 196B wire format + Schnorr (libmw Input)', () => {
+    const seed = (s) => bytesToHex(to32(sc(fromB(sha256(new TextEncoder().encode(s))))));
+    const coin = { output_id: bytesToHex(sha256(new TextEncoder().encode('mweb-in-outid'))), value: 5000000, blind: seed('mweb-in-blind'), spendKey: seed('mweb-in-spend') };
+    const inp = buildInput(coin);
+    if (inp.serialized.length !== 196) throw new Error('len ' + inp.serialized.length + ' want 196 (features byte present?)');
+    if (inp.serialized[0] !== 0x01) throw new Error('features=' + inp.serialized[0] + ' want 0x01');
+    // fields: features(1) | output_id(32) | commitment(33) | output_pubkey Ko(33) | input_pubkey Ki(33) | sig(64)
+    const outId = inp.serialized.slice(1, 33), Ko = inp.serialized.slice(66, 99), Ki = inp.serialized.slice(99, 132), sig = inp.serialized.slice(132, 196);
+    if (bytesToHex(outId) !== coin.output_id) throw new Error('output_id misplaced');
+    // verify sig vs aggregated owner key K_i + BLAKE3(Ki||Ko)*Ko over BLAKE3(features||output_id) (Input::BuildSignedMsg)
+    const keyHash = sc(fromB(hashNoTag(Ki, Ko)));
+    const aggKey = pub(P.fromHex(Ki).add(mul(P.fromHex(Ko), keyHash)));
+    if (!schnorrVerify(sig, hashNoTag(Uint8Array.of(0x01), outId), aggKey)) throw new Error('input signature does not verify');
+    return 'input 196B, Ko before Ki, sig ok';
   });
   const fails = checks.filter(c => !c.ok).map(c => c.name + (c.detail ? (': ' + c.detail) : ''));
   return { ok: fails.length === 0, fails, checks };
