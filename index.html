@@ -12,8 +12,8 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="TestnetWallet">
-<!-- CSP: no inline scripts. 'unsafe-eval'/'wasm-unsafe-eval' are for the lazy-loaded Monero engine (monero-ts WASM); first-party code never evals. connect-src = explorers + price APIs + the Monero testnet node. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; manifest-src 'self'; connect-src 'self' https://mempool.space https://litecoinspace.org https://api.coingecko.com https://api.coinbase.com https://xmr-testnet-node.librenode.com https://xmr-stagenet-node.librenode.com https://cypherfaucet.com; base-uri 'none'; form-action 'none'; object-src 'none'">
+<!-- CSP: no inline scripts. 'unsafe-eval'/'wasm-unsafe-eval' are for the lazy-loaded Monero engine (monero-ts WASM); first-party code never evals. connect-src = explorers + price APIs + the Monero testnet nodes + the Litecoin MWEB (Core REST) node. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; manifest-src 'self'; connect-src 'self' https://mempool.space https://litecoinspace.org https://api.coingecko.com https://api.coinbase.com https://xmr-testnet-node.librenode.com https://xmr-stagenet-node.librenode.com https://ltc-testnet-node.librenode.com https://cypherfaucet.com; base-uri 'none'; form-action 'none'; object-src 'none'">
 <title>TestnetWallet - learn and build on the Bitcoin, Litecoin & Monero testnets</title>
 <meta name="description" content="A free, open-source wallet for the Bitcoin, Litecoin and Monero testnets - a safe place to learn crypto and build, where real value is never at risk. Your keys never leave your browser.">
 <link rel="canonical" href="https://testnetwallet.net/">

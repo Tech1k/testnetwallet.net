@@ -17,6 +17,8 @@ import * as bip322 from './bip322.mjs';                 // BIP-322 message signi
 import * as xmr from './monero.mjs';
 import * as xmrSeed from './monero-mnemonic.mjs';
 import * as moneroEngine from './monero-engine.mjs';   // lazy: only fetches the ~6MB bundle on first balance/send
+import * as mweb from './mweb.mjs';                     // Litecoin MWEB receive-side crypto (BLAKE3, pure-JS)
+import * as mwebNode from './mweb-node.mjs';            // MWEB data layer: Litecoin Core REST, scanned client-side
 
 /* Clickjacking guard. A frame-ancestors directive in a <meta> CSP is ignored by browsers,
  * so for static hosting we bust out of frames here (a key-revealing wallet shouldn't be embeddable). */
@@ -32,6 +34,8 @@ const LTC_TESTNET = { bech32:'tltc', pubKeyHash:0x6f, scriptHash:0x3a, wif:0xef,
 
 // Kill-switch for the Monero coin: set to false to grey out its pill (e.g. if the Monero nodes go down).
 const MONERO_ENABLED = true;
+// Kill-switch for the Litecoin MWEB coin: set to false to grey out its pill (e.g. if the MWEB node goes down).
+const MWEB_ENABLED = true;
 const COINS = {
   btc:{ name:'Bitcoin', ticker:'tBTC', priceSym:'BTC', color:'#f7931a', enabled:true, uri:'bitcoin',
         msgPrefix:'Bitcoin Signed Message:\n',
@@ -162,12 +166,12 @@ async function migrateXmrCaches(toEncrypted, key){
   for(const k of keys){
     let raw; try { raw = await xmrCacheGet(k); } catch(_){ continue; }
     if(!raw) continue;
-    if(toEncrypted && raw.k && raw.c && !raw.tnwvault){
-      try { const e = await encWith(key, JSON.stringify({ k:raw.k, c:raw.c })); await xmrCachePut(k, { tnwvault:1, iv:e.iv, ct:e.ct }); }
-      catch(err){ console.warn('[storage] could not encrypt a Monero cache; dropping it (will re-sync):', k, err); try { await xmrCacheDel(k); } catch(_){} }
-    } else if(!toEncrypted && raw.tnwvault){
-      try { const j = JSON.parse(await decWith(key, raw.iv, raw.ct)); await xmrCachePut(k, { k:j.k, c:j.c }); }
-      catch(err){ console.warn('[storage] Monero cache decrypt failed on disable; dropping (will re-sync):', k, err); try { await xmrCacheDel(k); } catch(_){} }
+    if(toEncrypted && !raw.tnwvault){                    // plaintext -> encrypt the whole blob (Monero {k,c} or MWEB {v,owned,spent})
+      try { const e = await encWith(key, JSON.stringify(raw)); await xmrCachePut(k, { tnwvault:1, iv:e.iv, ct:e.ct }); }
+      catch(err){ console.warn('[storage] could not encrypt a cache; dropping it (will re-sync):', k, err); try { await xmrCacheDel(k); } catch(_){} }
+    } else if(!toEncrypted && raw.tnwvault){             // vault -> decrypt back to the original plaintext blob, shape-agnostic
+      try { const j = JSON.parse(await decWith(key, raw.iv, raw.ct)); await xmrCachePut(k, j); }
+      catch(err){ console.warn('[storage] cache decrypt failed on disable; dropping (will re-sync):', k, err); try { await xmrCacheDel(k); } catch(_){} }
     }
   }
 }
@@ -404,9 +408,10 @@ function txNet(tx, addrSet){
 
 /* ----------------------------- state ----------------------------- */
 const state = {
-  coin:'btc', addrType:'wpkh', fiat:'USD', account:0, xmrNet:'stagenet', xmrAccount:0,
-  wallet:null, master:null, scheme:'bip39', xmrKeys:null, xmrOk:null, xmrSeedOk:null, bip322Ok:null,
+  coin:'btc', addrType:'wpkh', ltcMweb:false, fiat:'USD', account:0, xmrNet:'stagenet', xmrAccount:0,
+  wallet:null, master:null, scheme:'bip39', xmrKeys:null, xmrOk:null, xmrSeedOk:null, bip322Ok:null, mwebKeys:null, mwebOk:null,
   xmr:{ wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null },   // Monero engine sync state
+  mweb:{ syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false },   // MWEB scan state
   addresses:[],          // [{index, path, address}]
   balances:{},           // address -> {confirmed,total}
   totalSats:0, confirmedSats:0, price:null, hideBalance:false, refreshMs:30000, feePref:'medium',
@@ -433,6 +438,7 @@ function setAddrCount(n){
 }
 function buildAddresses(){
   if(COINS[state.coin].addrModel === 'monero') return buildMoneroAddresses();
+  if(isMweb()) return buildMwebAddresses();
   const n = addrCount();
   state.balances = {}; state.totalSats = 0; state.confirmedSats = 0; state.txs = []; state.error = null;
   if(state.send){ state.send.utxos = null; state.send.selected = {}; }   // address set changed → stale coin-control cache
@@ -460,21 +466,34 @@ function buildMoneroAddresses(){
   try { for(let i=0;i<n;i++) addrs.push({ index:i, path:'account '+major+'/subaddress '+i, address: xmr.subaddress(state.xmrKeys, net, major, i) }); state.addresses = addrs; }   // major = selected Monero account (default 0)
   catch(e){ state.addresses = []; state.error = 'Could not derive Monero addresses: '+(e.message||e); }
 }
+function buildMwebAddresses(){
+  state.balances = {}; state.totalSats = 0; state.confirmedSats = 0; state.txs = []; state.error = null; state.expandedTx = null;
+  if(state.send){ state.send.utxos = null; state.send.selected = {}; }
+  if(state.mwebOk !== true || !state.mwebKeys){
+    state.addresses = []; state.error = state.mwebOk === false ? 'MWEB self-test failed; receive disabled.' : 'MWEB keys unavailable.'; return;
+  }
+  const n = addrCount(), addrs = [];
+  try { for(let i=0;i<n;i++) addrs.push({ index:i, path:"m/1/0/101' index "+i, address: mweb.addressFor(state.mwebKeys, i, 'testnet') }); state.addresses = addrs; }
+  catch(e){ state.addresses = []; state.error = 'Could not derive MWEB addresses: '+(e.message||e); }
+}
 function openWallet(w){
   _lastBal = null; _lastPending = new Set();                 // don't flash/settle across a wallet switch
   state.wallet = w;
   state.scheme = isElectrum(w) ? w.scheme : 'bip39';
-  if(state.scheme !== 'bip39'){                              // Electrum wallet: root cached at import (sync), no Monero
+  if(state.scheme !== 'bip39'){                              // Electrum wallet: root cached at import (sync), no Monero/MWEB
     state.master = HDKey.fromExtendedKey(w.xprv);
-    state.addrType = ELECTRUM_SCHEMES[state.scheme].addrType; state.account = 0; state.xmrKeys = null;
-    if(COINS[state.coin].addrModel === 'monero'){ state.coin = 'btc'; saveSettings(); }   // an Electrum wallet has no Monero keys; don't strand on the Monero view
+    state.addrType = ELECTRUM_SCHEMES[state.scheme].addrType; state.account = 0; state.xmrKeys = null; state.mwebKeys = null;
+    state.ltcMweb = false; if(COINS[state.coin].addrModel === 'monero'){ state.coin = 'btc'; saveSettings(); }   // an Electrum wallet has no Monero/MWEB keys; don't strand on those views
     state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };
+    state.mweb = { syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false };
     state.xmrAccount = 0; store.activeId = w.id; saveStore(); buildAddresses(); render(); refresh(); return;
   }
   state.master = HDKey.fromMasterSeed(mnemonicToSeedSync(w.mnemonic, w.passphrase || ''));
   state.addrType = (store.settings && TYPES[store.settings.addrType]) ? store.settings.addrType : (TYPES[state.addrType] ? state.addrType : 'wpkh');   // don't inherit a prior Electrum wallet's locked type
   try { state.xmrKeys = state.xmrOk === true ? xmr.keysFromSecret(state.master.derive("m/44'/128'/0'/0'").privateKey) : null; } catch(_){ state.xmrKeys = null; }
+  try { state.mwebKeys = state.mwebOk === true ? mweb.masterKeysFromMnemonic(w.mnemonic, w.passphrase || '') : null; } catch(_){ state.mwebKeys = null; }
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };   // reset Monero sync on wallet switch
+  state.mweb = { syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false };   // reset MWEB scan on wallet switch
   state.xmrAccount = 0;
   store.activeId = w.id; saveStore();
   buildAddresses(); render(); refresh();
@@ -482,7 +501,7 @@ function openWallet(w){
 function saveSettings(){
   store.settings = Object.assign({}, store.settings, { theme: document.documentElement.getAttribute('data-theme'),
     coin: state.coin, addrType: state.addrType, fiat: state.fiat, account: state.account,
-    hideBalance: state.hideBalance, refreshMs: state.refreshMs, feePref: state.feePref, xmrNet: state.xmrNet });   // spread keeps extra keys (e.g. custom api)
+    hideBalance: state.hideBalance, refreshMs: state.refreshMs, feePref: state.feePref, xmrNet: state.xmrNet, ltcMweb: state.ltcMweb });   // spread keeps extra keys (e.g. custom api)
   saveStore();
 }
 function addWallet(name, mnemonic, passphrase, created){
@@ -568,7 +587,7 @@ async function electrumImport(rawSeed, name, passphrase){
     mnemonic: det.seed, xprv: root.privateExtendedKey };
   if(passphrase) rec.passphrase = passphrase;
   store.wallets = store.wallets || []; store.wallets.push(rec); saveStore();
-  if(COINS[state.coin].addrModel === 'monero'){ state.coin = 'btc'; saveSettings(); }   // Electrum is a Bitcoin wallet
+  state.ltcMweb = false; if(COINS[state.coin].addrModel === 'monero'){ state.coin = 'btc'; saveSettings(); }   // Electrum is a Bitcoin wallet
   closeModal(); openWallet(rec);
   toast('Imported '+ELECTRUM_SCHEMES[det.scheme].label, 'ok');
 }
@@ -703,7 +722,7 @@ const GAP_LIMIT = 20;
 let _discoverTok = 0;
 const _discovered = new Set();
 async function discoverAddresses(ck){
-  if(!state.wallet || !state.master || COINS[state.coin].addrModel === 'monero'){ _discovered.delete(ck); return; }
+  if(!state.wallet || !state.master || COINS[state.coin].addrModel === 'monero' || isMweb()){ _discovered.delete(ck); return; }
   // Capture the FULL context up front (incl. account + scheme + master + wallet id) and derive against it
   // explicitly - never read live state.account across an await, so an account/coin/type switch can't mis-key
   // the write or scan a mix of accounts.
@@ -742,7 +761,7 @@ async function discoverAddresses(ck){
 /* ----------------------------- data refresh (race-guarded) ----------------------------- */
 async function refresh(){
   if(!state.wallet) return;
-  if(COINS[state.coin].addrModel === 'monero'){ state.loading = false; state.error = null; renderStatus(); return; }   // no backend yet (Phase 1)
+  if(COINS[state.coin].addrModel === 'monero' || isMweb()){ state.loading = false; state.error = null; renderStatus(); return; }   // Monero + MWEB use their own client-side scanners, not Esplora
   const ck = state.wallet.id+'|'+state.coin+'|'+state.addrType+'|'+state.account;
   if(!_discovered.has(ck)){ _discovered.add(ck); discoverAddresses(ck); }   // one-time gap-limit discovery per context (retries itself if superseded)
   const seq = ++state.refreshSeq;
@@ -864,11 +883,19 @@ function renderControls(){
   };
   const typePills = el('div',{class:'pills'});
   for(const [key,t] of Object.entries(TYPES)){
-    const p = el('div',{class:'pill'+(key===state.addrType?' active':''),title:TYPE_HELP[key]||''}, t.label);
+    const p = el('div',{class:'pill'+((!isMweb() && key===state.addrType)?' active':''),title:TYPE_HELP[key]||''}, t.label);
     p.addEventListener('click', ()=>switchType(key));
     typePills.append(p);
   }
+  if(state.coin === 'ltc'){   // MWEB: a 4th Litecoin address type (private stealth + scan-based balance), reached from here
+    const en = mwebEnabled();
+    const mp = el('div',{class:'pill'+(isMweb()?' active':'')+(en?'':' disabled'),
+      title: en ? 'MWEB (MimbleWimble Extension Blocks): private stealth addresses; balance is scanned from a Litecoin node' : (MWEB_ENABLED ? 'MWEB is temporarily unavailable (a startup self-test failed in this browser)' : 'MWEB is temporarily unavailable while the node is being set up')}, 'MWEB');
+    if(en) mp.addEventListener('click', switchToMweb);
+    typePills.append(mp);
+  }
   const xmrMode = COINS[state.coin].addrModel === 'monero';
+  const mwebMode = isMweb();
   const electrum = !!(state.scheme && ELECTRUM_SCHEMES[state.scheme]);
   let netPills = null;
   if(xmrMode){ netPills = el('div',{class:'pills'});
@@ -888,12 +915,12 @@ function renderControls(){
       el('div',{class:'between'}, el('span',{class:'sub',title:xmrMode?'Stagenet and testnet are two independent Monero test networks.':'Different address formats from the same recovery phrase. Hover each for details.'}, xmrMode?'Network':(electrum?'Wallet type':'Address type')),
         xmrMode?netPills:(electrum ? el('span',{class:'sub'}, ELECTRUM_SCHEMES[state.scheme].label) : typePills)),
       electrum ? el('div',{class:'sub faint',style:'margin-top:-2px'},'Imported from an Electrum seed. The address type and derivation are fixed to match Electrum.') : null,
-      (xmrMode||electrum) ? null : el('div',{class:'sub faint',style:'margin-top:2px'},'Different formats from your one recovery phrase. SegWit (tb1q…) is the default; Taproot (tb1p…) is newest.'),
-      (xmrMode||electrum) ? null : el('div',{class:'between'},
+      (xmrMode||electrum||mwebMode) ? null : el('div',{class:'sub faint',style:'margin-top:2px'},'Different formats from your one recovery phrase. SegWit (tb1q…) is the default; Taproot (tb1p…) is newest.'),
+      (xmrMode||electrum||mwebMode) ? null : el('div',{class:'between'},
         el('span',{class:'sub',title:'BIP-44 account index (advanced): a separate, independent set of addresses derived from the same recovery phrase. Leave at 0 unless you want to keep funds in distinct accounts.'},'Account index'),
         el('input',{type:'number',min:'0',value:state.account,style:'max-width:80px','aria-label':'BIP account index',title:'Advanced: BIP account index. Leave at 0 unless you want a separate set of addresses.',
           onchange:e=>{ const a=Math.max(0,parseInt(e.target.value)||0); if(a===state.account){ render(); return; } state.account=a; saveSettings(); buildAddresses(); render(); refresh(); }})),
-      (xmrMode||electrum) ? null : el('div',{class:'sub faint',style:'margin-top:-2px'},'A separate set of addresses under the same recovery phrase. Most people leave this at 0.'),
+      (xmrMode||electrum||mwebMode) ? null : el('div',{class:'sub faint',style:'margin-top:-2px'},'A separate set of addresses under the same recovery phrase. Most people leave this at 0.'),
     ));
 }
 
@@ -987,6 +1014,7 @@ function renderXmrRestore(){
 function renderBalance(){
   const c = COINS[state.coin];
   if(c.addrModel === 'monero') return renderMoneroHero(c);
+  if(isMweb()) return renderMwebHero(c);
   const fiat = state.price!=null
     ? el('div',{class:'fiat'},'≈ '+FIATS[state.fiat]+((state.totalSats/1e8)*state.price).toFixed(2)+' '+state.fiat+' · testnet, no real value')
     : el('div',{class:'fiat'},'testnet coins, no real value');
@@ -1015,6 +1043,15 @@ function renderBalance(){
 
 /* ---- tabs ---- */
 function renderTabs(){
+  if(isMweb()){
+    const cur = ['send','history'].includes(state.tab) ? state.tab : 'receive';
+    const bar = el('div',{class:'tabbar'});
+    for(const [k,l] of [['receive','Receive'],['send','Send'],['history','History']]){
+      const t = el('div',{class:'tab'+(k===cur?' active':'')}, l);
+      t.addEventListener('click', ()=>{ state.tab = k; render(); }); bar.append(t);
+    }
+    return bar;
+  }
   if(COINS[state.coin].addrModel === 'monero'){
     const bar = el('div',{class:'tabbar'});
     for(const [k,l] of [['receive','Receive'],['send','Send'],['history','History'],['advanced','Tools']]){
@@ -1033,6 +1070,11 @@ function renderTabs(){
   return bar;
 }
 function renderPanel(){
+  if(isMweb()){
+    if(state.tab==='send') return renderMwebSend();
+    if(state.tab==='history') return renderMwebHistory();
+    return renderMwebReceive();
+  }
   if(COINS[state.coin].addrModel === 'monero'){
     if(state.tab==='send') return renderMoneroSend();
     if(state.tab==='history') return renderMoneroHistory();
@@ -1650,8 +1692,11 @@ function txActions(t, c){
 }
 
 /* ----------------------------- coin / type switching ----------------------------- */
+function mwebEnabled(){ return MWEB_ENABLED && state.mwebOk === true; }
+function isMweb(){ return state.coin === 'ltc' && state.ltcMweb === true && mwebEnabled(); }   // MWEB is an address-type within Litecoin, not a separate coin
 function switchCoin(coin){ if(!COINS[coin].enabled||coin===state.coin) return; state.coin=coin; _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); render(); refresh(); }
-function switchType(type){ if(type===state.addrType) return; state.addrType=type; saveSettings(); buildAddresses(); render(); refresh(); }
+function switchType(type){ if(type===state.addrType && !state.ltcMweb) return; state.ltcMweb=false; state.addrType=type; saveSettings(); buildAddresses(); render(); refresh(); }
+function switchToMweb(){ if(isMweb()) return; state.ltcMweb=true; saveSettings(); buildAddresses(); render(); }   // enter MWEB mode on the Litecoin wallet
 function switchXmrNet(net){ if(net===state.xmrNet || !xmr.XMR_NETS[net] || state.xmr.syncing) return; state.xmrNet=net; state.xmrAccount=0;
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };   // each net has its own balance + cache; reset so the new net re-syncs (auto-resumes from its own cache)
   saveSettings(); buildAddresses(); render(); }
@@ -1668,7 +1713,7 @@ function xmrStatusInner(){
   const secs = _xmrT0 ? Math.floor((Date.now() - _xmrT0) / 1000) : 0;
   const elapsed = secs ? (' · ' + fmtDur(secs)) : '';
   let label, pct = 0, indet = true;
-  if(x.phase === 'engine') label = 'Loading the Monero engine (~6 MB, first run only)…';
+  if(x.phase === 'engine') label = 'Loading the Monero engine (~6 MB, first run only). This can take a moment…';
   else if(x.phase === 'connecting') label = 'Connecting to ' + (xmrHost() || 'the node') + '…';
   else {
     const tip = x.endHeight || 0, start = x.start || 0, h = x.height || 0;
@@ -1840,6 +1885,296 @@ async function moneroSync(){
     catch(e){ console.warn('[monero] getData failed:', e); }
   } catch(e){ sx.error = e.message || String(e); }
   finally { clearInterval(_xmrTick); _xmrTick = null; sx.syncing = false; render(); }
+}
+
+/* ----------------------------- Litecoin MWEB (receive-side scan via Core REST, no engine) ----------------------------- */
+const DEFAULT_MWEB_NODE = 'https://ltc-testnet-node.librenode.com';   // litecoind with -rest, behind a CORS+TLS proxy. Override in Settings.
+function mwebNodeUrl(){ return (store.settings && store.settings.mwebNode) || DEFAULT_MWEB_NODE || ''; }
+function mwebHost(){ try { return new URL(mwebNodeUrl()).host; } catch(_){ return ''; } }
+function mwebBroadcastUrl(){ return (store.settings && store.settings.mwebBroadcast) || ''; }   // the method-allowlisted sendrawtransaction proxy (read-only REST can't broadcast)
+function fmtMwebLtc(litoshi){ const n = Number(litoshi)/1e8; return n.toFixed(8).replace(/\.?0+$/,'') || '0'; }
+const MWEB_FRESH_LOOKBACK = 1000;   // first scan covers ~1000 blocks back from tip (a recent window, like Monero's lookback); in-app wallets scan only from creation, and deeper history uses the restore-height control
+const MWEB_DATA_PREFIX = 'testnetwallet.mweb.';
+function mwebDataKey(walletId){ return MWEB_DATA_PREFIX + walletId; }   // single network (LTC testnet); shares the tnw-xmr IndexedDB store + encryption rules
+async function loadMwebData(walletId){
+  try {
+    let d = await xmrCacheGet(mwebDataKey(walletId)); if(!d) return null;
+    if(d.tnwvault){ if(!_cryptoKey) return null; d = JSON.parse(await decWith(_cryptoKey, d.iv, d.ct)); }   // encrypted cache
+    if(d && d.v === 1) return d;
+  } catch(_){}
+  return null;
+}
+function saveMwebData(walletId, data){
+  if(_encOn && !_cryptoKey) return;       // locked: don't persist owned outputs/keys in any form
+  const plain = JSON.stringify(data);
+  _writeChain = _writeChain.then(async ()=>{
+    if(_encOn && !_cryptoKey) return;
+    try {
+      if(_encOn && _cryptoKey){ const e = await encWith(_cryptoKey, plain); await xmrCachePut(mwebDataKey(walletId), { tnwvault:1, iv:e.iv, ct:e.ct }); }
+      else { try { const cur = JSON.parse(localStorage.getItem(LS_KEY)); if(cur && cur.tnwvault){ _encOn=true; _locked=true; _cryptoKey=null; try{ render(); }catch(_){} return; } } catch(_){}   // another tab enabled encryption: never write plaintext over a vault
+        await xmrCachePut(mwebDataKey(walletId), JSON.parse(plain)); }
+    } catch(e){ console.warn('[mweb] cache not persisted:', e); }
+  }).catch(()=>{});
+}
+function deleteMwebData(walletId){ xmrCacheDel(mwebDataKey(walletId)).catch(()=>{}); }
+function getMwebRestore(walletId){ const o = store.settings && store.settings.mwebRestore; return (o && o[walletId] != null) ? o[walletId] : null; }
+function setMwebRestore(walletId, height){
+  store.settings = store.settings || {};
+  store.settings.mwebRestore = store.settings.mwebRestore || {};
+  if(height == null) delete store.settings.mwebRestore[walletId]; else store.settings.mwebRestore[walletId] = height;
+  saveStore();
+}
+let _mwebAbort = null, _mwebT0 = 0, _mwebTick = null;
+function mwebStatusInner(){
+  const mx = state.mweb;
+  const secs = _mwebT0 ? Math.floor((Date.now() - _mwebT0) / 1000) : 0;
+  const elapsed = secs ? (' · ' + fmtDur(secs)) : '';
+  const tip = mx.tip || 0, start = mx.start || 0, h = mx.height || 0;
+  const span = tip - start, done = Math.max(0, h - start);
+  let label, pct = 0, indet = true;
+  if(!mx.tip) label = 'Connecting to ' + (mwebHost() || 'the node') + '…';
+  else {
+    pct = span > 0 ? Math.min(100, Math.round(done / span * 100)) : 0;
+    label = 'Scanning block ' + h.toLocaleString() + ' / ' + tip.toLocaleString();
+    if(span > 0) label += ' · ' + done.toLocaleString() + ' of ' + span.toLocaleString() + ' (' + pct + '%)';
+    if(secs > 2 && done > 0 && span > done){ const rem = Math.ceil(secs * (span - done) / done); if(rem > 0 && rem < 86400) label += ' · ~' + fmtDur(rem) + ' left'; }
+    indet = !(h && tip && h >= start);
+  }
+  return [ el('div',{}, label + elapsed),
+    el('div',{class:'pbar' + (indet ? ' indet' : '')}, indet ? el('span',{}) : el('span',{style:'width:'+pct+'%'})) ];
+}
+function renderMwebStatus(){ const e = $('mweb-sync'); if(!e) return; clear(e); for(const n of mwebStatusInner()) e.append(n); }
+function maybeAutoResumeMweb(){
+  const mx = state.mweb;
+  if(!state.wallet || mx.syncing || mx.synced || mx._autoTried || !mwebNodeUrl() || !state.mwebKeys) return;
+  mx._autoTried = true;
+  xmrCacheGet(mwebDataKey(state.wallet.id)).then(c => { if(c && state.mweb === mx && isMweb() && !mx.syncing && !mx.synced) mwebSync(); }).catch(()=>{});
+}
+function mwebTxList(owned, spent){
+  const list = [];
+  for(const [id, u] of owned) list.push({ output_id:id, value:u.value, height:u.height, index:u.index, spent:spent.has(id) });
+  list.sort((a,b) => (b.height||0) - (a.height||0));
+  return list;
+}
+async function mwebSync(){
+  const mx = state.mweb; if(mx.syncing) return;
+  const node = mwebNodeUrl();
+  if(!node){ mx.error = 'Set a Litecoin MWEB node in Settings first.'; render(); return; }
+  if(!state.mwebKeys){ mx.error = 'MWEB keys unavailable.'; render(); return; }
+  const walletId = state.wallet.id;
+  mx.syncing = true; mx.error = null; mx.start = 0; mx.height = 0; mx.tip = 0;
+  _mwebAbort = new AbortController(); _mwebT0 = Date.now(); clearInterval(_mwebTick); _mwebTick = setInterval(renderMwebStatus, 1000); render();
+  try {
+    const tip = await mwebNode.getTip(node, _mwebAbort.signal);
+    mx.node = { url:node, at:Date.now(), ok:true, height:tip.height, mwebActive:tip.mwebActive, chain:tip.chain };
+    mx.tip = tip.height;
+    if(!tip.mwebActive) throw new Error('MWEB is not active on this node or chain.');
+    const saved = await loadMwebData(walletId);
+    const owned = new Map(), spent = new Set();
+    let fromH;
+    if(saved){                                              // resume: only scan new blocks since last time
+      for(const u of (saved.owned || [])) owned.set(u.output_id, u);
+      for(const id of (saved.spent || [])) spent.add(id);
+      fromH = (saved.scannedTo || 0) + 1;
+    } else {                                                // first scan: from the chosen (or a recent) height
+      let restore = getMwebRestore(walletId);
+      if(restore == null){
+        let lookback = MWEB_FRESH_LOOKBACK;
+        if(state.wallet.createdAt) lookback = Math.min(MWEB_FRESH_LOOKBACK, Math.ceil((Date.now() - state.wallet.createdAt) / 150000) + 50);   // ~150s/LTC testnet block + buffer
+        restore = Math.max(0, tip.height - lookback);
+      }
+      fromH = restore;
+    }
+    mx.start = fromH; mx.height = fromH; render();
+    console.log('[mweb] node', node, '· scan', fromH, '->', tip.height);
+    if(fromH <= tip.height){
+      await mwebNode.scanRange(node, state.mwebKeys, fromH, tip.height, {
+        gap:50, owned, spent, signal:_mwebAbort.signal,
+        onProgress:(h, cnt)=>{ mx.height = h; mx.ownedCount = cnt; renderMwebStatus(); },
+      });
+    }
+    mx.owned = owned; mx.spent = spent;
+    mx.balance = mwebNode.balanceOf(owned, spent);
+    mx.txs = mwebTxList(owned, spent);
+    mx.scannedTo = tip.height; mx.synced = true;
+    getPrice('LTC', state.fiat).then(p => { if(state.mweb === mx && isMweb()){ mx.price = p; render(); } }).catch(()=>{});   // LTC fiat estimate for the hero
+    saveMwebData(walletId, { v:1, scannedTo:tip.height, owned:[...owned.values()], spent:[...spent] });   // persist for fast re-scan
+  } catch(e){ if(e && e.name === 'AbortError') mx.error = null; else mx.error = e.message || String(e); }
+  finally { clearInterval(_mwebTick); _mwebTick = null; mx.syncing = false; _mwebAbort = null; render(); }
+}
+function renderMwebHero(c){
+  const mx = state.mweb, node = mwebNodeUrl();
+  maybeAutoResumeMweb();                                    // a previously-scanned wallet auto-resumes incrementally on entry
+  const balLine = (mx.synced && mx.balance != null) ? (fmtMwebLtc(mx.balance) + ' LTC') : '- LTC';
+  let status;
+  if(mx.syncing) status = el('div',{id:'mweb-sync',class:'fiat'}, ...mwebStatusInner());
+  else if(mx.synced){
+    const nout = mx.txs ? mx.txs.length : 0;
+    const fiatStr = (mx.price != null && mx.balance != null && mx.balance > 0n) ? ('≈ ' + FIATS[state.fiat] + (Number(mx.balance)/1e8 * mx.price).toFixed(2) + ' ' + state.fiat + ' · ') : '';
+    status = el('div',{class:'fiat'}, fiatStr + nout + ' MWEB output' + (nout===1?'':'s') + ' · testnet, no real value');
+  }
+  else if(!node) status = el('div',{class:'fiat'}, 'Set a Litecoin MWEB node in Settings to load your balance.');
+  else status = el('div',{class:'fiat'}, 'Balance loads on demand (scans MWEB blocks from your node, in your browser).');
+  const actions = [ el('button',{class:'btn ghost',onclick:()=>{ state.tab='receive'; render(); }}, '↓ Receive') ];
+  if(node && !mx.syncing && mx.synced && mx.balance != null && mx.balance > 0n) actions.unshift(el('button',{class:'btn',onclick:()=>{ state.tab='send'; render(); }}, '↑ Send'));
+  if(node && !mx.syncing) actions.unshift(el('button',{class:'btn',onclick:mwebSync}, mx.synced ? '↻ Re-scan' : '⇅ Connect & scan'));
+  if(mx.syncing) actions.push(el('button',{class:'btn ghost',onclick:()=>{ if(_mwebAbort) _mwebAbort.abort(); }}, 'Stop'));
+  const hero = el('div',{class:'card hero'},
+    el('div',{class:'card-b',style:'text-align:center'},
+      el('div',{class:'between',style:'text-align:left'},
+        el('span',{class:'sub',style:'display:inline-flex;align-items:center;gap:7px'}, el('img',{class:'coin-ico',src:'icons/ltc.svg',alt:''}), 'Litecoin MWEB · testnet'),
+        el('div',{})),
+      el('div',{class:'balance',style:'margin:16px 0 2px'}, balLine),
+      status,
+      node ? el('div',{class:'sub faint',style:'margin-top:6px'}, 'Node ' + (mwebHost() || node) + (mx.node && mx.node.height ? (' · block ' + mx.node.height.toLocaleString()) : '')) : null,
+      mx.error ? el('div',{class:'msg bad',style:'text-align:left'}, mx.error) : null,
+      el('div',{class:'hero-actions'}, ...actions),
+    ));
+  if(!node || mx.syncing) return hero;
+  const frag = document.createDocumentFragment();
+  frag.append(hero, renderMwebRestore());
+  return frag;
+}
+function renderMwebRestore(){
+  const mx = state.mweb, walletId = state.wallet.id;
+  const cur = getMwebRestore(walletId);
+  const hInput = el('input',{type:'number',min:'0',step:'1',style:'max-width:150px',placeholder:'block height',value: cur!=null ? String(cur) : ''});
+  const tipBtn = el('button',{class:'btn ghost sm'},'Use current tip');
+  tipBtn.addEventListener('click', async ()=>{
+    tipBtn.disabled = true; const o = tipBtn.textContent; tipBtn.textContent = '…';
+    try { const t = await mwebNode.getTip(mwebNodeUrl()); if(t && t.height) hInput.value = String(t.height); else toast('Could not fetch height','warn'); }
+    catch(_){ toast('Could not fetch height','warn'); } finally { tipBtn.disabled = false; tipBtn.textContent = o; }
+  });
+  const applyBtn = el('button',{class:'btn sm'}, mx.synced ? 'Re-scan from here' : 'Save');
+  applyBtn.addEventListener('click', async ()=>{
+    const v = hInput.value.trim(); const h = v==='' ? null : Math.max(0, parseInt(v,10) || 0);
+    setMwebRestore(walletId, h);
+    deleteMwebData(walletId);                              // a changed restore height invalidates any persisted cache
+    if(mx.synced){
+      state.mweb = { syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:true };
+      toast('Restore height set. Re-scanning…','ok'); mwebSync();
+    } else { toast(h==null ? 'Cleared. Next scan uses the default window.' : 'Saved. Used on next scan.','ok'); render(); }
+  });
+  return el('details',{class:'card',style:'margin:14px 0'},
+    el('summary',{style:'padding:13px 18px;cursor:pointer;font-weight:600;font-size:14px'}, 'Scan from height' + (cur!=null ? (' · ' + cur.toLocaleString()) : ' (auto)')),
+    el('div',{class:'card-b stack'},
+      el('div',{class:'sub'},'Only the first scan walks the chain. Set this near where this wallet first received MWEB funds, or use the current tip for a brand-new wallet. Leave blank for the default (recent window).'),
+      el('div',{class:'row',style:'flex:0;align-items:center'}, hInput, tipBtn),
+      el('div',{}, applyBtn)));
+}
+function renderMwebReceive(){
+  const c = COINS[state.coin];
+  if(!state.addresses.length) return el('div',{class:'card'}, el('div',{class:'card-b'}, el('div',{class:'msg bad'}, state.error || 'MWEB addresses unavailable.')));
+  const primary = state.addresses[state.addresses.length-1];
+  const uri = 'litecoin:' + primary.address;
+  const qrWrap = el('div',{style:'text-align:center'});
+  const q = qrEl(uri, {coin:'ltc'}); if(q){ q.style.cursor='zoom-in'; q.title='Tap to enlarge'; q.addEventListener('click',()=>zoomQR(uri,'ltc')); qrWrap.append(q); }
+  const list = el('table',{}, el('thead',{}, el('tr',{}, el('th',{},'#'), el('th',{},'MWEB address'), el('th',{},''))));
+  const tb = el('tbody',{});
+  for(const a of state.addresses){ const cp = el('span',{class:'copy'},'copy'); cp.addEventListener('click', ()=>copyText(a.address, cp));
+    tb.append(el('tr',{}, el('td',{class:'mono faint'}, a.index===0?'main':a.index), el('td',{}, el('div',{class:'addr'}, a.address)), el('td',{}, cp))); }
+  list.append(tb);
+  const copyAddr = el('button',{class:'btn ghost sm'},'Copy address'); copyAddr.addEventListener('click', ()=>copyText(primary.address, copyAddr));
+  return el('div',{class:'card'},
+    el('div',{class:'card-h'}, 'Receive MWEB', el('span',{class:'sub'}, 'Litecoin testnet · from your recovery phrase')),
+    el('div',{class:'card-b stack'},
+      qrWrap,
+      el('div',{class:'sub'}, primary.index===0 ? 'Primary MWEB address' : ('MWEB address ' + primary.index)),
+      el('div',{class:'addr',style:'font-size:14px'}, primary.address),
+      el('div',{class:'row',style:'flex:0;margin:6px 0 4px'}, copyAddr,
+        el('button',{class:'btn ghost sm',onclick:deriveNext},'Derive next address')),
+      el('div',{class:'sub faint'},'A tmweb stealth address (bech32). Send Litecoin testnet coins here over MWEB; your balance and history appear after you scan on the balance screen. Same recovery phrase as your Litecoin wallet, so MWEB funds restore in any MWEB-capable Litecoin wallet.'),
+      el('hr',{class:'hr'}),
+      el('div',{class:'sub'},'Your MWEB addresses'), list,
+    ));
+}
+function renderMwebHistory(){
+  const mx = state.mweb;
+  if(!mx.synced) return el('div',{class:'card'}, el('div',{class:'card-b'}, el('div',{class:'sub'}, mx.syncing ? 'Scanning…' : 'Connect and scan on the balance screen to load your MWEB history.')));
+  const txs = mx.txs || [];
+  if(!txs.length) return el('div',{class:'card'}, el('div',{class:'card-h'},'MWEB activity'), el('div',{class:'card-b'}, el('div',{class:'sub'}, 'No MWEB outputs found for this wallet in the scanned range.')));
+  const tb = el('tbody',{});
+  for(const t of txs){
+    const cp = el('span',{class:'copy'},'copy'); cp.addEventListener('click', ()=>copyText(t.output_id, cp));
+    tb.append(el('tr',{},
+      el('td',{}, el('span',{class: t.spent ? '' : 'ok'}, t.spent ? '↑ spent' : '↓ received')),
+      el('td',{class:'mono'}, fmtMwebLtc(t.value) + ' LTC'),
+      el('td',{class:'mono faint'}, t.height ? t.height.toLocaleString() : '-'),
+      el('td',{}, el('div',{class:'addr',style:'max-width:200px'}, t.output_id), cp)));
+  }
+  return el('div',{class:'card'},
+    el('div',{class:'card-h'},'MWEB activity', el('span',{class:'sub'}, 'received outputs · testnet')),
+    el('div',{class:'card-b'},
+      el('div',{class:'sub faint',style:'margin-bottom:8px'},'MWEB is private: amounts and outputs are visible only to you, so there is no public per-transaction explorer link.'),
+      el('table',{}, el('thead',{}, el('tr',{}, el('th',{},''), el('th',{},'Amount'), el('th',{},'Block'), el('th',{},'Output ID'))), tb)));
+}
+
+function renderMwebSend(){
+  const mx = state.mweb;
+  if(!mx.synced) return el('div',{class:'card'}, el('div',{class:'card-b'}, el('div',{class:'sub'}, mx.syncing ? 'Scanning…' : 'Connect and scan on the balance screen before sending.')));
+  const spendable = []; if(mx.owned) for(const [id,u] of mx.owned) if(!mx.spent || !mx.spent.has(id)) spendable.push(u);
+  const total = spendable.reduce((a,u)=>a+BigInt(u.value), 0n);
+  const s = state.mwebSend = state.mwebSend || { to:'', amount:'', fee:'10000' };
+  const broadcastUrl = mwebBroadcastUrl();
+  const toLitoshi = (str)=>{ const t=String(str).trim(); if(t===''||t==='.'||!/^\d*\.?\d*$/.test(t)) return null; const [i,f='']=t.split('.'); if(f.length>8) return null; return BigInt(i||'0')*100000000n + BigInt((f+'00000000').slice(0,8)); };
+  const msg = el('div',{});
+  const clearHex = ()=>{ s._hex=null; };
+  const toIn = el('input',{type:'text',placeholder:'tmweb1… or a Litecoin testnet address',value:s.to}); toIn.addEventListener('input', e=>{ s.to=e.target.value; clearHex(); });
+  const amtIn = el('input',{type:'text',inputmode:'decimal',placeholder:'amount in LTC',value:s.amount}); amtIn.addEventListener('input', e=>{ s.amount=e.target.value; clearHex(); });
+  const feeIn = el('input',{type:'number',min:'0',step:'1',style:'max-width:150px',value:s.fee}); feeIn.addEventListener('input', e=>{ s.fee=e.target.value; clearHex(); });
+  async function build(){
+    const amt = toLitoshi(s.amount), fee = BigInt(parseInt(s.fee,10)||0);
+    if(amt==null || amt<=0n) throw new Error('Enter a valid amount.');
+    const toStr = (s.to||'').trim();
+    const dest = mweb.decodeStealthAddress(toStr);
+    let recipient;
+    if(dest) recipient = { address: dest, value: amt };                                  // MWEB -> MWEB
+    else if(isValidAddress(toStr, 'ltc')) recipient = { script: btc.OutScript.encode(btc.Address(COINS.ltc.net).decode(toStr)), value: amt };   // MWEB -> transparent (peg-out)
+    else throw new Error('Enter a valid tmweb or Litecoin testnet address.');
+    if(amt+fee > total) throw new Error('Insufficient MWEB balance (' + fmtMwebLtc(total) + ' LTC spendable).');
+    const sorted = spendable.slice().sort((a,b)=> (BigInt(a.value) < BigInt(b.value) ? -1 : 1));   // smallest-first selection
+    const sel=[]; let acc=0n; for(const u of sorted){ sel.push(u); acc+=BigInt(u.value); if(acc>=amt+fee) break; }
+    if(acc < amt+fee) throw new Error('Could not select enough coins.');
+    const recipients = [recipient];
+    const change = acc - amt - fee;
+    if(change > 0n){ const ch = mweb.stealthAddress(state.mwebKeys, 0); recipients.push({ address:{ scan:ch.Abytes, spend:ch.Bbytes }, value: change }); }   // change always stays in MWEB (our index-0 address)
+    const coins = sel.map(u=>({ output_id:u.output_id, value:u.value, blind:u.blind, spendKey:u.spendKey }));
+    return mweb.buildTransaction({ coins, recipients, fee });
+  }
+  const dryBtn = el('button',{class:'btn ghost'}, 'Check (dry-run)');
+  dryBtn.addEventListener('click', async ()=>{
+    if(!broadcastUrl){ toast('Set an MWEB broadcast endpoint in Settings first.','warn'); return; }
+    dryBtn.disabled=true; clear(msg).append(el('div',{class:'sub'},'Building range proof + checking with the node…'));
+    try { const hex = await build(); const r = await mwebNode.testAccept(broadcastUrl, hex);
+      if(r && r.allowed){ s._hex=hex; clear(msg).append(el('div',{class:'msg ok'}, 'Valid - the node would accept this' + (r.vsize?(' (vsize ' + r.vsize + ')'):'') + '. Press Send to broadcast.')); }
+      else clear(msg).append(el('div',{class:'msg bad'}, 'Node rejected: ' + ((r && r['reject-reason']) || 'unknown'))); }
+    catch(e){ clear(msg).append(el('div',{class:'msg bad'}, e.message||String(e))); }
+    finally { dryBtn.disabled=false; }
+  });
+  const sendBtn = el('button',{class:'btn'}, '↑ Send');
+  sendBtn.addEventListener('click', ()=>{
+    if(!broadcastUrl){ toast('Set an MWEB broadcast endpoint in Settings first.','warn'); return; }
+    confirmModal('Send ' + (s.amount||'?') + ' LTC over MWEB? Testnet only - no real value.', async ()=>{
+      sendBtn.disabled=true; clear(msg).append(el('div',{class:'sub'},'Building range proof + broadcasting…'));
+      try { const hex = s._hex || await build(); const txid = await mwebNode.broadcast(broadcastUrl, hex);
+        s._hex=null; s.amount=''; s.to='';
+        clear(msg).append(el('div',{class:'msg ok'}, 'Broadcast. txid ', el('span',{class:'mono'}, txid)));
+        setTimeout(()=>{ const m2=state.mweb; if(m2){ m2.synced=false; m2._autoTried=false; } if(isMweb()) mwebSync(); }, 3000);   // re-scan to reflect the spend
+      } catch(e){ clear(msg).append(el('div',{class:'msg bad'}, e.message||String(e))); }
+      finally { sendBtn.disabled=false; }
+    }, { yes:'Send' });
+  });
+  return el('div',{class:'card'},
+    el('div',{class:'card-h'}, 'Send MWEB', el('span',{class:'sub'}, fmtMwebLtc(total) + ' LTC spendable · testnet')),
+    el('div',{class:'card-b stack'},
+      el('div',{class:'field'}, el('label',{class:'fld'},'To (tmweb, or a Litecoin address to peg-out)'), toIn),
+      el('div',{class:'field'}, el('label',{class:'fld'},'Amount (LTC)'), amtIn),
+      el('div',{class:'field'}, el('label',{class:'fld'},'Fee (litoshi)'), feeIn),
+      el('div',{class:'sub faint'},'Send to a tmweb address to stay private, or to a regular Litecoin testnet address to peg-out (the node settles that to a transparent output). A 64-bit range proof is built in your browser (a small prover loads once), then broadcast through your node. Always Check (dry-run) first. Sending is new, so verify on testnet.'),
+      broadcastUrl ? null : el('div',{class:'msg warn'},'Set an MWEB broadcast endpoint in Settings (run tools/mweb-rpc-proxy.js) to enable sending.'),
+      el('div',{class:'row',style:'flex:0'}, dryBtn, sendBtn),
+      msg,
+    ));
 }
 
 /* ============================== MODALS ============================== */
@@ -2117,6 +2452,7 @@ function actWallets(editId){
         if(store.xmrLabels) delete store.xmrLabels[w.id];
         if(store.settings && store.settings.xmrRestore) delete store.settings.xmrRestore[w.id];
         deleteXmrData(w.id);                                   // purge the wallet's Monero keys+cache too
+        deleteMwebData(w.id);                                  // and the MWEB scan cache
         saveStore();
         if(state.wallet && state.wallet.id===w.id){
           const next = (store.wallets||[])[0];
@@ -3534,6 +3870,16 @@ function actSettings(){
     async base => { if(!base || base.indexOf('http')!==0) throw new Error('set an https URL'); const r = await pingUrl(base + '/get_height'); const j = await r.json();
       if(!r.ok || !j || !j.height) throw new Error('HTTP '+r.status+' (CORS/HTTPS?)'); return 'block '+Number(j.height).toLocaleString(); },
     DEFAULT_XMR_NODE[net] || '');
+  const mwebNodeField = () => endpointField(DEFAULT_MWEB_NODE || 'https://your-litecoin-node',
+    ()=>(store.settings && store.settings.mwebNode) || '',
+    v=>{ store.settings = store.settings || {}; if(v) store.settings.mwebNode = v; else delete store.settings.mwebNode; saveStore(); if(state.mweb){ state.mweb.synced=false; state.mweb._autoTried=false; } },
+    async base => { const t = await mwebNode.getTip(base); if(!t || !t.height) throw new Error('no chaininfo (CORS/HTTPS/-rest?)'); return 'block '+Number(t.height).toLocaleString()+(t.mwebActive?' · mweb active':' · mweb INACTIVE'); },
+    DEFAULT_MWEB_NODE || '');
+  const mwebBroadcastField = () => endpointField('https://your-node/rpc  (or http://localhost:19090)',
+    ()=>(store.settings && store.settings.mwebBroadcast) || '',
+    v=>{ store.settings = store.settings || {}; if(v) store.settings.mwebBroadcast = v; else delete store.settings.mwebBroadcast; saveStore(); },
+    async base => { try { await mwebNode.testAccept(base, 'ff'); return 'endpoint reachable'; } catch(e){ const m=String(e.message||''); if(/fetch|networkerror|cors|failed to/i.test(m)) throw new Error('unreachable (CORS/URL?)'); return 'reachable (node responded)'; } },
+    '');
   const expAll = el('button',{class:'btn ghost'},'Export full backup');
   expAll.addEventListener('click', exportSnapshot);
   const impInput = el('input',{type:'file',accept:'application/json,.json',style:'display:none'});
@@ -3571,6 +3917,9 @@ function actSettings(){
       el('div',{class:'field'}, el('label',{class:'fld'},'Litecoin Esplora API'), apiField('ltc')),
       el('div',{class:'field'}, el('label',{class:'fld'},'Monero node RPC (stagenet)'), xmrNodeField('stagenet')),
       el('div',{class:'field'}, el('label',{class:'fld'},'Monero node RPC (testnet)'), xmrNodeField('testnet')),
+      el('div',{class:'field'}, el('label',{class:'fld'},'Litecoin MWEB node (Core REST)'), mwebNodeField()),
+      el('div',{class:'field'}, el('label',{class:'fld'},'MWEB broadcast endpoint (for sending)'), mwebBroadcastField()),
+      el('div',{class:'sub faint',style:'margin-top:0'},'Sending needs a method-allowlisted sendrawtransaction proxy (run tools/mweb-rpc-proxy.js, or front it on the same host as the node). Receiving does not. A custom origin must also be in connect-src (index.html + _headers).'),
       el('div',{class:'sub faint',style:'margin-top:0'},'Fields are prefilled with the built-in default; leave one as-is to keep using it (it updates with new releases), or enter your own Esplora instance or Monero node and press Default to revert. A custom origin must also be allowed by the page Content-Security-Policy (connect-src in _headers), which you control when self-hosting. The Monero node needs CORS (--rpc-access-control-origins), and HTTPS on an https site.'),
       el('div',{class:'sub faint'},'Privacy: each refresh reveals your addresses to the block explorer, and the fiat estimate sends the coin to the price API; both can tie those to your IP. Over Tor that stays a deanonymization surface.'),
       el('hr',{class:'hr'}),
@@ -3662,13 +4011,15 @@ function afterStoreLoaded(){
   const s = store.settings || {};
   applyTheme(s.theme || 'dark');
   if(s.xmrNet && xmr.XMR_NETS[s.xmrNet]) state.xmrNet = s.xmrNet;
-  if(s.coin && COINS[s.coin] && COINS[s.coin].enabled) state.coin = s.coin;
+  if(s.coin === 'mweb'){ state.coin = 'ltc'; state.ltcMweb = true; }   // migrate the old separate-pill MWEB "coin" to the Litecoin address-type
+  else if(s.coin && COINS[s.coin] && COINS[s.coin].enabled) state.coin = s.coin;
   if(s.addrType && TYPES[s.addrType]) state.addrType = s.addrType;
   if(s.fiat && FIATS[s.fiat]) state.fiat = s.fiat;
   if(typeof s.account === 'number' && s.account >= 0) state.account = s.account;
   if(typeof s.hideBalance === 'boolean') state.hideBalance = s.hideBalance;
   if(typeof s.refreshMs === 'number' && s.refreshMs >= 10000) state.refreshMs = s.refreshMs;
   if(s.feePref) state.feePref = s.feePref;
+  if(typeof s.ltcMweb === 'boolean') state.ltcMweb = s.ltcMweb;
   const active = (store.wallets||[]).find(w=>w.id===store.activeId) || (store.wallets||[])[0];
   if(active) openWallet(active); else render();
   handleDeepLink();
@@ -3722,6 +4073,11 @@ function boot(){
     state.xmrSeedOk = ss.ok; state.xmrOk = st.ok && ss.ok; COINS.xmr.enabled = MONERO_ENABLED && state.xmrOk;
     if(!state.xmrOk) console.warn('Monero self-test failed; Monero disabled:', st.fails, ss.fails);
   } catch(e){ state.xmrOk = false; state.xmrSeedOk = false; COINS.xmr.enabled = false; console.warn('Monero self-test error:', e); }
+  try {
+    const ms = mweb.selfTest();
+    state.mwebOk = ms.ok;
+    if(!ms.ok) console.warn('MWEB self-test failed; MWEB disabled:', ms.fails);
+  } catch(e){ state.mwebOk = false; console.warn('MWEB self-test error:', e); }
   try {
     const bs = bip322.selfTest(COINS.btc.net);
     state.bip322Ok = bs.ok;
