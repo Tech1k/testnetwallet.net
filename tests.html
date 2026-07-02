@@ -5,11 +5,12 @@
      It re-runs the modules' own exported selfTest()s (the same gates the app uses at boot) AND checks
      address derivation against published known-answer vectors (BIP44/49/84/86, Electrum) through the SAME
      vendored @scure/@noble libraries the wallet ships - so a swapped/broken vendored dep fails here loudly.
-     Logic is in tests.js (external, so it runs under the site's strict CSP too). -->
+     Logic is in tests.js (external). This page ships its own CSP meta below, so it is sandboxed the same way even on plain static hosts (GitHub Pages etc. that ignore _headers). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
 <title>TestnetWallet - crypto tests</title>
 <style>
   body{font-family:ui-sans-serif,system-ui,Inter,sans-serif; background:#14161b; color:#e6e8ec; margin:0; padding:24px; line-height:1.5}

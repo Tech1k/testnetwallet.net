@@ -10,3 +10,8 @@ Thumbs.db
 tools/monero-bundle/node_modules/
 tools/monero-bundle/package-lock.json
 raw.txt
+
+# Stray native-build research inputs (must never ship on the public static host)
+/mweb_policy.cpp
+/mweb_policy.h
+tools/mweb-bp-bundle/secp256k1-zkp/

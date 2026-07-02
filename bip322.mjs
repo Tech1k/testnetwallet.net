@@ -33,7 +33,7 @@ const dsha256 = b => sha256(sha256(b));
 function beNum(b){ let n=0n; for(const x of b) n=(n<<8n)|BigInt(x); return n; }
 function le32(n){ return Uint8Array.of(n&0xff,(n>>>8)&0xff,(n>>>16)&0xff,(n>>>24)&0xff); }
 function le64(n){ const o=new Uint8Array(8); let v=BigInt(n); for(let i=0;i<8;i++){ o[i]=Number(v&0xffn); v>>=8n; } return o; }
-function varint(n){ if(n<0xfd) return Uint8Array.of(n); if(n<=0xffff) return Uint8Array.of(0xfd,n&0xff,(n>>8)&0xff); return Uint8Array.of(0xfe,n&0xff,(n>>8)&0xff,(n>>16)&0xff,(n>>24)&0xff); }
+function varint(n){ if(n<0xfd) return Uint8Array.of(n); if(n<=0xffff) return Uint8Array.of(0xfd,n&0xff,(n>>8)&0xff); if(n>0xffffffff) throw new Error('varint out of range'); return Uint8Array.of(0xfe,n&0xff,(n>>8)&0xff,(n>>16)&0xff,(n>>>24)&0xff); }
 function b64encode(b){ let s=''; for(const x of b) s+=String.fromCharCode(x); return btoa(s); }
 function b64decode(str){ const s=atob(String(str).trim()); const a=new Uint8Array(s.length); for(let i=0;i<s.length;i++) a[i]=s.charCodeAt(i); return a; }
 function eqBytes(a,b){ if(!a || !b || a.length!==b.length) return false; let d=0; for(let i=0;i<a.length;i++) d|=a[i]^b[i]; return d===0; }

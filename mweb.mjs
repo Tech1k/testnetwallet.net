@@ -103,12 +103,27 @@ function masterKeysFromMnemonic(mnemonic, passphrase) {
 }
 // keychain spend scalar b_i = b + H('A', le32 i, scan)  (libmw GetSpendKey: SecretKeys::From(spend).Add(mi))
 function spendKeyAt(keys, i) { return scAdd(keys.spend, htagScalar('A', u32le(i), keys.scanBytes)); }
+// per-index spend PUBKEY B_i = b_i*G. Works from the spend secret (full wallet) OR the spend master pubkey
+// (view-only): B_i = B + H('A', le32 i, scan)*G. Lets a view key derive addresses + scan without spend power.
+function spendPubAt(keys, i) {
+  if (keys.spend != null) return mul(G, spendKeyAt(keys, i));
+  return keys.spendPub.add(mul(G, htagScalar('A', u32le(i), keys.scanBytes)));
+}
 // stealth address: B_i = b_i*G, A_i = scan*B_i  (libmw GetStealthAddress: Ai = Bi.Mul(scanSecret))
 function stealthAddress(keys, i) {
-  const bi = spendKeyAt(keys, i);
-  const Bi = mul(G, bi);
+  const Bi = spendPubAt(keys, i);
   const Ai = mul(Bi, keys.scan);
-  return { i, bi, A: Ai, B: Bi, Abytes: pub(Ai), Bbytes: pub(Bi) };
+  return { i, bi: (keys.spend != null) ? spendKeyAt(keys, i) : null, A: Ai, B: Bi, Abytes: pub(Ai), Bbytes: pub(Bi) };
+}
+/* ---------------- View key (watch-only): scan secret + spend master pubkey ---------------- */
+// 65 bytes = scan secret(32) || spend master pubkey(33). Holder can scan (see balance/history) and derive
+// receive addresses, but CANNOT spend (no spend secret). Export to audit; import as a watch-only wallet.
+function exportViewKey(keys) { return bytesToHex(concatBytes(keys.scanBytes, pub(mul(G, keys.spend)))); }
+function parseViewKey(hexOrBytes) {
+  const b = (typeof hexOrBytes === 'string') ? hexToBytes(hexOrBytes.trim()) : hexOrBytes;
+  if (b.length !== 65) throw new Error('bad MWEB view key (need 65 bytes: scan32 || spendPub33)');
+  const scanBytes = b.slice(0, 32);
+  return { scan: fromB(scanBytes), scanBytes, spendPub: P.fromHex(b.slice(32, 65)), watchOnly: true };
 }
 
 /* ---------------- Output create (sender side) ---------------- */
@@ -149,10 +164,12 @@ function outputScan(keys, out, gap=50) {
   if (htag('T', pub(shared))[0] !== out.viewTag) return null; // cheap view-tag reject
   const t = htag('D', pub(shared));                           // t = H('D', shared)
   const hO = htagScalar('O', t);                              // H('O', t)
-  // find our address index: the one-time spend key b_i*H('O',t) must reproduce Ko = (b_i*H('O',t))*G
-  let index = -1, spendKey = 0n;
-  for (let i=0;i<gap;i++) { const sk = scMul(spendKeyAt(keys, i), hO); if (mul(G, sk).equals(Ko)) { index = i; spendKey = sk; break; } }
+  // match our address index: Ko must equal H('O',t)*B_i. Use the per-index spend PUBKEY so a view-only wallet
+  // works too; a full wallet additionally recovers the one-time spend secret below for spending.
+  let index = -1;
+  for (let i=0;i<gap;i++) { if (mul(spendPubAt(keys, i), hO).equals(Ko)) { index = i; break; } }
   if (index < 0) return null;
+  const spendKey = (keys.spend != null) ? scMul(spendKeyAt(keys, index), hO) : null;
   const addr = stealthAddress(keys, index);
   const valueMask = htag('Y', t), nonceMask = htag('X', t);
   const valueBytes = xorBytes(out.maskedValue, valueMask, 0, 8);
@@ -292,7 +309,7 @@ function scanBlockOutputs(keys, outputs, gap = 50) {
       commitment: bytesToHex(a.commitment),
       value: r.value.toString(),
       index: r.index,
-      spendKey: bytesToHex(to32(r.spendKey)),
+      spendKey: r.spendKey != null ? bytesToHex(to32(r.spendKey)) : null,   // null for a watch-only (view-key) wallet: scannable, not spendable
       blind: bytesToHex(to32(r.blind)),
     });
   }
@@ -324,6 +341,7 @@ function writeVarInt(value) {
 function compactSize(n) {
   if (n < 0xfd) return Uint8Array.of(n);
   if (n <= 0xffff) return Uint8Array.of(0xfd, n & 0xff, (n >> 8) & 0xff);
+  if (n > 0xffffffff) throw new Error('compactSize out of range: ' + n);   // would need the 8-byte 0xff form; never legitimate here - fail loudly, don't truncate
   return Uint8Array.of(0xfe, n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff);
 }
 const u32leB = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0, true); return b; };
@@ -425,9 +443,10 @@ function serializePegOut(p) {   // WriteVarInt(amount) || CScript (compactSize-p
   return concatBytes(writeVarInt(p.value), compactSize(p.script.length), p.script);
 }
 /* ---- kernel (MWEB->MWEB or peg-out; features = FEE | [PEGOUT] | STEALTH_EXCESS) ---- */
-function buildKernel(kernelBlind, stealthBlind, fee, pegouts) {
+function buildKernel(kernelBlind, stealthBlind, fee, pegouts, pegin) {
   pegouts = pegouts || [];
-  const features = 0x01 | (pegouts.length ? 0x04 : 0x00) | 0x10;   // FEE | [PEGOUT] | STEALTH_EXCESS
+  const hasPegin = pegin != null && BigInt(pegin) > 0n;
+  const features = 0x01 | (hasPegin ? 0x02 : 0x00) | (pegouts.length ? 0x04 : 0x00) | 0x10;   // FEE | [PEGIN] | [PEGOUT] | STEALTH_EXCESS
   const excessPt = pedersen(0n, kernelBlind);                    // Commitment::Blinded(kernelBlind, 0) = kernelBlind*G
   const excess = commitBytes(excessPt);
   const stealthExcess = pub(mul(G, stealthBlind));
@@ -435,25 +454,26 @@ function buildKernel(kernelBlind, stealthBlind, fee, pegouts) {
   const h = sc(fromB(hashNoTag(pub(excessPt), stealthExcess)));
   const sigKey = scAdd(scMul(kernelBlind, h), stealthBlind);
   const feeV = writeVarInt(fee);
+  const peginV = hasPegin ? writeVarInt(pegin) : new Uint8Array(0);
   const pegBytes = pegouts.length ? concatBytes(compactSize(pegouts.length), ...pegouts.map(serializePegOut)) : new Uint8Array(0);
-  // GetSignatureMessage order: features || excess || fee || [pegouts] || stealth_excess
-  const sigMsg = hashNoTag(Uint8Array.of(features), excess, feeV, pegBytes, stealthExcess);
+  // GetSignatureMessage order: features || excess || fee || [pegin] || [pegouts] || stealth_excess
+  const sigMsg = hashNoTag(Uint8Array.of(features), excess, feeV, peginV, pegBytes, stealthExcess);
   const signature = schnorrSign(sigKey, sigMsg);
-  // wire order: features || fee || [pegouts] || stealth_excess || excess || signature
-  const serialized = concatBytes(Uint8Array.of(features), feeV, pegBytes, stealthExcess, excess, signature);
-  return { serialized };
+  // wire order: features || fee || [pegin] || [pegouts] || stealth_excess || excess || signature
+  const serialized = concatBytes(Uint8Array.of(features), feeV, peginV, pegBytes, stealthExcess, excess, signature);
+  return { serialized, kernelId: blake3(serialized) };          // GetKernelID() = Hashed(kernel) = BLAKE3(serialized)
 }
 
 /* ---- assemble + serialize the full transaction; returns the extended raw-tx hex ---- */
 // opts: { coins:[selected UTXOs], recipients:[{address: tmweb string | {scan,spend}, value}], fee }
 // Caller is responsible for coin selection (sum(coins) == sum(recipients) + fee), incl. a change recipient.
-async function buildTransaction({ coins, recipients, fee }) {
-  if (!coins || !coins.length) throw new Error('no inputs selected');
+// Build the mw::Transaction bytes (kernel_offset || stealth_offset || TxBody) + the kernel ID.
+// Generalized value invariant: Sum(in) + pegin == Sum(recipients incl. change/pegouts) + fee.
+async function assembleMwTx({ coins, recipients, fee, pegin = 0n }) {
+  coins = coins || []; pegin = BigInt(pegin || 0n);
   if (!recipients || !recipients.length) throw new Error('no recipients');
-  // value invariant (KernelSumValidator H-axis): Sum(in) must equal Sum(recipients incl. change + pegouts) + fee,
-  // or the node rejects an otherwise-valid tx as "bad-mweb-txn". Surface a clear error instead of that.
   const vIn = coins.reduce((a, c) => a + BigInt(c.value), 0n), vOut = recipients.reduce((a, r) => a + BigInt(r.value), 0n);
-  if (vIn !== vOut + BigInt(fee)) throw new Error('MWEB value imbalance: inputs ' + vIn + ' != recipients ' + vOut + ' + fee ' + BigInt(fee) + ' (coin selection/change is off; node would reject as bad-mweb-txn)');
+  if (vIn + pegin !== vOut + BigInt(fee)) throw new Error('MWEB value imbalance: in ' + vIn + ' + pegin ' + pegin + ' != out ' + vOut + ' + fee ' + BigInt(fee) + ' (node would reject as bad-mweb-txn)');
   const inputs = coins.map(buildInput);
   const outs = [], pegouts = [];
   for (const r of recipients) {
@@ -476,7 +496,7 @@ async function buildTransaction({ coins, recipients, fee }) {
   let sik = 0n; for (const i of inputs) sik = scAdd(sik, i.totalKey);
   const stealthOffset = scAdd(sok, scAdd(sik, sc(N - stealthBlind)));
   pegouts.sort((a, b) => a.value !== b.value ? (a.value < b.value ? -1 : 1) : byteCmp(a.script, b.script));   // PegOutCoin canonical order (amount, then script)
-  const kernel = buildKernel(kernelBlind, stealthBlind, fee, pegouts);
+  const kernel = buildKernel(kernelBlind, stealthBlind, fee, pegouts, pegin);
   // canonical ordering: inputs by output_id, outputs by output hash (single kernel needs no sort)
   inputs.sort((a, b) => byteCmp(a.outputId, b.outputId));
   outs.sort((a, b) => byteCmp(a.outputId, b.outputId));
@@ -485,9 +505,50 @@ async function buildTransaction({ coins, recipients, fee }) {
     compactSize(outs.length), ...outs.map(o => o.serialized),
     compactSize(1), kernel.serialized);
   const mwTx = concatBytes(to32(kernelOffset), to32(stealthOffset), body);   // kernel_offset||stealth_offset||TxBody
+  return { mwTx, kernelId: kernel.kernelId };
+}
+/* ---- assemble + serialize a pure-MWEB transaction (MWEB->MWEB or peg-out); returns extended raw-tx hex ---- */
+// opts: { coins:[selected UTXOs], recipients:[{address|script, value}], fee }. Caller balances Sum(coins)==Sum(recipients)+fee.
+async function buildTransaction({ coins, recipients, fee }) {
+  if (!coins || !coins.length) throw new Error('no inputs selected');
+  const { mwTx } = await assembleMwTx({ coins, recipients, fee, pegin: 0n });
   // canonical extended LTC tx: nVersion(4) || 00 (dummy vin) || 08 (flags) || 00 vin || 00 vout || 01 (mweb set) || mwTx || nLockTime(4)
   const raw = concatBytes(u32leB(2), Uint8Array.of(0x00, 0x08, 0x00, 0x00, 0x01), mwTx, u32leB(0));
   return bytesToHex(raw);
+}
+/* ---- peg-in: build the MWEB extension (no MWEB inputs; kernel carries pegin_amount) + the peg-in output script ---- */
+// opts: { recipients:[{address|{scan,spend}, value}], fee, pegin }. Invariant: pegin == Sum(recipients) + fee.
+// Returns { mwTx, kernelId, peginScript } to splice into a transparent tx (the peg-in vout uses peginScript + value pegin).
+async function buildPegInMweb({ recipients, fee, pegin }) {
+  const { mwTx, kernelId } = await assembleMwTx({ coins: [], recipients, fee, pegin });
+  const peginScript = concatBytes(Uint8Array.of(0x59, 0x20), kernelId);   // EncodeOP_N(9)=OP_9(0x59), push 32, kernel_id
+  return { mwTx, kernelId, peginScript };
+}
+/* ---- splice an MWEB extension into a SIGNED transparent LTC tx (parses canonical, sets flag 0x08, inserts mweb_tx) ---- */
+function spliceMwebIntoTx(ltcTxBytes, mwTx) {
+  const b = (ltcTxBytes instanceof Uint8Array) ? ltcTxBytes : hexToBytes(ltcTxBytes);
+  let p = 0;
+  const rd = (k) => { const s = b.slice(p, p + k); p += k; return s; };
+  const cs = () => { const n0 = b[p++]; if (n0 < 0xfd) return n0; if (n0 === 0xfd) { const v = b[p] | (b[p+1]<<8); p+=2; return v; } if (n0 === 0xfe) { const v = (b[p]|(b[p+1]<<8)|(b[p+2]<<16)) + b[p+3]*16777216; p+=4; return v; } let v = 0; for (let i=0;i<8;i++) v += b[p+i]*Math.pow(2,8*i); p+=8; return v; };
+  const nVersion = rd(4);
+  let flags = 0, hasMarker = false;
+  if (b[p] === 0x00) { hasMarker = true; p += 1; flags = b[p++]; }      // segwit marker 0x00 + flags
+  const nIn = cs(); const vinStart = p;
+  for (let i=0;i<nIn;i++){ rd(36); const sl = cs(); rd(sl); rd(4); }    // prevout(36) + scriptSig(varlen) + sequence(4)
+  const vin = b.slice(vinStart, p);
+  const nOut = cs(); const voutStart = p;
+  for (let i=0;i<nOut;i++){ rd(8); const sl = cs(); rd(sl); }           // value(8) + scriptPubKey(varlen)
+  const vout = b.slice(voutStart, p);
+  let witness = new Uint8Array(0);
+  if (hasMarker && (flags & 1)) { const wStart = p; for (let i=0;i<nIn;i++){ const items = cs(); for (let j=0;j<items;j++){ const il = cs(); rd(il); } } witness = b.slice(wStart, p); }
+  const nLockTime = rd(4);
+  const outFlags = flags | 0x08;
+  return bytesToHex(concatBytes(
+    nVersion, Uint8Array.of(0x00, outFlags),
+    compactSize(nIn), vin, compactSize(nOut), vout,
+    (outFlags & 1) ? witness : new Uint8Array(0),
+    Uint8Array.of(0x01), mwTx,                                          // mweb_tx = WrapOptionalPtr is_set(1) || mw::Transaction
+    nLockTime));
 }
 
 /* ---------------- Self-test (run in-browser; gates the feature) ---------------- */
@@ -510,6 +571,33 @@ function selfTest() {
     const other = masterKeysFromSeed(sha512(new TextEncoder().encode('other-wallet')).slice(0, 64));
     if (outputScan(other, out, 10)) throw new Error('foreign wallet false-positive');
     return 'recovered ' + (Number(value) / 1e8) + ' LTC at index 3';
+  });
+  chk('view key: export -> watch-only scan (no spend power)', () => {
+    const keys = masterKeysFromSeed(sha512(new TextEncoder().encode('mweb-viewkey-seed')).slice(0, 64));
+    const addr = stealthAddress(keys, 5);
+    const value = 777000000n;
+    const out = outputCreate(addr.A, addr.B, value, fromB(sha256(new TextEncoder().encode('vk-ks'))));
+    const vk = exportViewKey(keys);
+    if (vk.length !== 130) throw new Error('view key not 65 bytes');
+    const watch = parseViewKey(vk);
+    if (bytesToHex(stealthAddress(watch, 5).Bbytes) !== bytesToHex(addr.Bbytes)) throw new Error('watch-only address mismatch');
+    const found = outputScan(watch, out, 10);
+    if (!found) throw new Error('watch-only scan found nothing');
+    if (found.value !== value || found.index !== 5) throw new Error('watch-only value/index mismatch');
+    if (found.spendKey !== null) throw new Error('view key must NOT yield a spend key');
+    return 'watch-only saw ' + (Number(value) / 1e8) + ' LTC, no spend key';
+  });
+  chk('MWEB splice: set flag 0x08 + insert mweb_tx (segwit tx)', () => {
+    // minimal segwit LTC tx: v1, marker 00 flag 01, 1 vin, 1 vout (p2wpkh), 1 witness (2 items), locktime 0
+    const ltc = '01000000' + '00' + '01' + '01' + '11'.repeat(32) + '00000000' + '00' + 'ffffffff' + '01' + '1027000000000000' + '16' + '0014' + '22'.repeat(20) + '02' + '01aa' + '01bb' + '00000000';
+    const out = spliceMwebIntoTx(hexToBytes(ltc), hexToBytes('deadbeef'));
+    const sp = hexToBytes(out);
+    if (sp[4] !== 0x00) throw new Error('marker lost');
+    if ((sp[5] & 0x08) === 0) throw new Error('MWEB flag not set');
+    if ((sp[5] & 0x01) === 0) throw new Error('witness flag lost');
+    if (bytesToHex(sp.slice(-4)) !== '00000000') throw new Error('nLockTime lost');
+    if (!out.includes('01deadbeef00000000')) throw new Error('mweb_tx (is_set || tx) not framed before nLockTime');
+    return 'spliced ' + sp.length + 'B, flags 0x' + sp[5].toString(16);
   });
   chk('tmweb address encode -> decode round-trip', () => {
     const keys = masterKeysFromSeed(sha512(new TextEncoder().encode('mweb-addr-test')).slice(0, 64));
@@ -550,14 +638,15 @@ function selfTest() {
 }
 
 export {
-  masterKeysFromSeed, masterKeysFromMnemonic, spendKeyAt, stealthAddress,
+  masterKeysFromSeed, masterKeysFromMnemonic, spendKeyAt, spendPubAt, stealthAddress,
+  exportViewKey, parseViewKey,
   outputCreate, outputScan, switchCommit, blindSwitch, pedersen,
   htag, htagScalar, commitBytes, selfTest,
   encodeStealthAddress, decodeStealthAddress, addressFor,
   parseOutputMessage, adaptOutput, scanBlockOutputs,
   bech32Encode, bech32Decode, convertBits, MWEB_HRP,
   schnorrSign, schnorrVerify, buildSendOutput, buildInput, buildKernel,
-  buildTransaction, rangeProof, loadBP, serializeOutputMessage,
+  buildTransaction, buildPegInMweb, spliceMwebIntoTx, assembleMwTx, rangeProof, loadBP, serializeOutputMessage,
   writeVarInt, compactSize, hashNoTag, isQuad, commitmentToPubkey,
   H, J, G,
 };

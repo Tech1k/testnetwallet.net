@@ -237,8 +237,9 @@ function softLock(){ if(!_pin || !_cryptoKey){ lockWallet(); return; } _softLock
 function lockWallet(){   // FULL lock: wipe the in-memory key + decrypted seed + PIN + sensitive state, require the password
   _cryptoKey = null; _locked = true; _pin = null; _softLocked = false;
   _discoverTok++; state.refreshSeq++;   // abort any in-flight gap-scan / refresh fetches so the locked wallet stops emitting address queries
-  state.master = null; state.wallet = null; state.xmrKeys = null; state.addresses = [];
+  state.master = null; state.wallet = null; state.xmrKeys = null; state.mwebKeys = null; state.mwebSend = null; state.watchOnly = false; state.addresses = [];
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };
+  state.mweb = { syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false };   // wipe MWEB keys + scan cache too
   store = {};   // drop the only reference to the decrypted mnemonics/passphrases; unlockVault repopulates it
   state.balances = {}; state.txs = []; state.totalSats = 0; state.confirmedSats = 0; state.price = null;   // public residue, cleared for symmetry
   closeModal();
@@ -409,7 +410,7 @@ function txNet(tx, addrSet){
 /* ----------------------------- state ----------------------------- */
 const state = {
   coin:'btc', addrType:'wpkh', ltcMweb:false, fiat:'USD', account:0, xmrNet:'stagenet', xmrAccount:0,
-  wallet:null, master:null, scheme:'bip39', xmrKeys:null, xmrOk:null, xmrSeedOk:null, bip322Ok:null, mwebKeys:null, mwebOk:null,
+  wallet:null, master:null, watchOnly:false, scheme:'bip39', xmrKeys:null, xmrOk:null, xmrSeedOk:null, bip322Ok:null, mwebKeys:null, mwebOk:null,
   xmr:{ wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null },   // Monero engine sync state
   mweb:{ syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false },   // MWEB scan state
   addresses:[],          // [{index, path, address}]
@@ -438,7 +439,7 @@ function setAddrCount(n){
 }
 function buildAddresses(){
   if(COINS[state.coin].addrModel === 'monero') return buildMoneroAddresses();
-  if(isMweb()) return buildMwebAddresses();
+  if(isMweb() || state.watchOnly) return buildMwebAddresses();   // a view-key wallet is MWEB-only and has no state.master; never take the seed path
   const n = addrCount();
   state.balances = {}; state.totalSats = 0; state.confirmedSats = 0; state.txs = []; state.error = null;
   if(state.send){ state.send.utxos = null; state.send.selected = {}; }   // address set changed → stale coin-control cache
@@ -479,6 +480,16 @@ function buildMwebAddresses(){
 function openWallet(w){
   _lastBal = null; _lastPending = new Set();                 // don't flash/settle across a wallet switch
   state.wallet = w;
+  if(w.viewKey){                                             // watch-only MWEB wallet (view key only, no seed)
+    state.scheme = 'bip39'; state.watchOnly = true; state.master = null; state.xmrKeys = null;
+    try { state.mwebKeys = mweb.parseViewKey(w.viewKey); } catch(_){ state.mwebKeys = null; }
+    state.coin = 'ltc'; state.ltcMweb = true; state.addrType = 'wpkh'; state.account = 0; state.xmrAccount = 0;
+    state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };
+    state.mweb = { syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false };
+    state.mwebSend = null;
+    store.activeId = w.id; saveStore(); buildAddresses(); render(); refresh(); return;
+  }
+  state.watchOnly = false;
   state.scheme = isElectrum(w) ? w.scheme : 'bip39';
   if(state.scheme !== 'bip39'){                              // Electrum wallet: root cached at import (sync), no Monero/MWEB
     state.master = HDKey.fromExtendedKey(w.xprv);
@@ -511,6 +522,27 @@ function addWallet(name, mnemonic, passphrase, created){
   if(created) w.createdAt = Date.now();   // in-app-created wallet has no history before now: its Monero first-sync scans only from ~creation, not a deep window
   store.wallets = store.wallets || []; store.wallets.push(w); saveStore();
   closeModal(); openWallet(w);
+}
+// Watch-only MWEB wallet from an exported view key (scan/receive, no spend).
+function addViewWallet(name, viewKeyHex){
+  mweb.parseViewKey(viewKeyHex);   // throws on bad key
+  const w = { id: uid(), name: name || ('Watch '+((store.wallets||[]).length+1)), viewKey: viewKeyHex.trim() };
+  store.wallets = store.wallets || []; store.wallets.push(w); saveStore();
+  closeModal(); openWallet(w);
+}
+function actWatchViewKey(){
+  const nameIn = el('input',{type:'text',placeholder:'Wallet name (optional)'});
+  const vkIn = el('textarea',{rows:'3',placeholder:'Paste an MWEB view key (130 hex chars)',style:'width:100%;font-family:ui-monospace,monospace;font-size:12px;word-break:break-all'});
+  const msg = el('div',{});
+  const goBtn = el('button',{class:'btn'},'Watch');
+  goBtn.addEventListener('click', ()=>{ clear(msg); try { addViewWallet(nameIn.value.trim(), vkIn.value.trim()); } catch(e){ msg.append(el('div',{class:'msg bad'}, e.message||String(e))); } });
+  const cancelBtn = el('button',{class:'btn ghost'},'Cancel'); cancelBtn.addEventListener('click', closeModal);
+  showModal(el('div',{class:'card',style:'max-width:520px'},
+    el('div',{class:'card-h'},'Watch a view key'),
+    el('div',{class:'card-b stack'},
+      el('div',{class:'sub faint'},'Import an MWEB view key (from another wallet’s Receive screen, Export view key) to watch a balance read-only. You see the balance, history, and receive addresses, but cannot spend. Litecoin MWEB only.'),
+      nameIn, vkIn, msg,
+      el('div',{class:'row',style:'flex:0'}, goBtn, cancelBtn))));
 }
 
 /* ===================== Electrum seed import (single-sig) =====================
@@ -597,10 +629,13 @@ async function electrumImport(rawSeed, name, passphrase){
 function snapshotData(){
   return {
     type:'testnetwallet-backup', version:2, exportedAt: new Date().toISOString(),
-    wallets: (store.wallets||[]).map(w => ({ id:w.id, name:w.name, mnemonic:w.mnemonic, ...(w.passphrase?{passphrase:w.passphrase}:{}), ...(w.scheme?{scheme:w.scheme,xprv:w.xprv}:{}), ...(w.createdAt?{createdAt:w.createdAt}:{}) })),
+    wallets: (store.wallets||[]).map(w => ({ id:w.id, name:w.name, ...(w.viewKey?{viewKey:w.viewKey}:{mnemonic:w.mnemonic}), ...(w.passphrase?{passphrase:w.passphrase}:{}), ...(w.scheme?{scheme:w.scheme,xprv:w.xprv}:{}), ...(w.createdAt?{createdAt:w.createdAt}:{}) })),
     activeId: store.activeId || null,
     counts: store.counts || {},
     txNotes: store.txNotes || {},
+    xmrLabels: store.xmrLabels || {},                                                  // Monero subaddress labels (per wallet)
+    xmrRestore: (store.settings && store.settings.xmrRestore) || {},                    // per-wallet Monero restore heights
+    mwebRestore: (store.settings && store.settings.mwebRestore) || {},                  // per-wallet MWEB restore heights
     contacts: store.contacts || [],
     multisig: (store.multisig || []).filter(msValidRecord),
     settings: store.settings || {},
@@ -638,9 +673,13 @@ function exportSnapshot(){
 // a fresh browser adopts the whole snapshot; an existing store merges in what's new without deleting anything.
 function importBackup(data){
   if(!data || typeof data !== 'object') throw new Error('not a backup file');
-  const incoming = Array.isArray(data.wallets) ? data.wallets : (data.mnemonic ? [data] : null);
+  const incoming = Array.isArray(data.wallets) ? data.wallets : ((data.mnemonic || data.viewKey) ? [data] : null);
   if(!incoming) throw new Error('no wallets found in this file');
   const norm = w => {
+    if(w && typeof w.viewKey === 'string' && w.viewKey){               // watch-only MWEB wallet (view key)
+      try { mweb.parseViewKey(w.viewKey); } catch(_){ return null; }
+      return { id:(typeof w.id==='string' && w.id) || uid(), name:(typeof w.name==='string' && w.name.trim()) || '', viewKey:w.viewKey.trim() };
+    }
     if(w && w.scheme && ELECTRUM_SCHEMES[w.scheme]){                    // Electrum wallet: validate the cached xprv, not BIP39
       if(typeof w.xprv !== 'string') return null;
       try { HDKey.fromExtendedKey(w.xprv); } catch(_){ return null; }
@@ -659,13 +698,14 @@ function importBackup(data){
 
   const fresh = !(store.wallets && store.wallets.length);
   store.wallets = store.wallets || [];
-  const sig = w => (w.xprv || w.mnemonic || '') + '\n' + (w.passphrase || '');
+  const sig = w => (w.xprv || w.mnemonic || w.viewKey || '') + '\n' + (w.passphrase || '');
   const have = new Set(store.wallets.map(sig));
   let addedW = 0, addedC = 0;
   for(const w of valid){
     if(have.has(sig(w))) continue;
     if(store.wallets.some(x => x.id === w.id)) w.id = uid();            // keep ids (so counts/notes line up), but never collide
-    const rec = { id:w.id, name: w.name || ('Wallet '+(store.wallets.length+1)), mnemonic:w.mnemonic };
+    const rec = w.viewKey ? { id:w.id, name: w.name || ('Watch '+(store.wallets.length+1)), viewKey:w.viewKey }
+                          : { id:w.id, name: w.name || ('Wallet '+(store.wallets.length+1)), mnemonic:w.mnemonic };
     if(w.passphrase) rec.passphrase = w.passphrase;
     if(w.createdAt) rec.createdAt = w.createdAt;
     if(w.scheme && ELECTRUM_SCHEMES[w.scheme]){ rec.scheme = w.scheme; rec.xprv = w.xprv; }
@@ -675,6 +715,12 @@ function importBackup(data){
     for(const k of Object.keys(data.counts)) if(store.counts[k] == null) store.counts[k] = data.counts[k]; }
   if(data.txNotes && typeof data.txNotes === 'object'){ store.txNotes = store.txNotes || {};
     for(const k of Object.keys(data.txNotes)) store.txNotes[k] = Object.assign({}, data.txNotes[k], store.txNotes[k]); }
+  if(data.xmrLabels && typeof data.xmrLabels === 'object'){ store.xmrLabels = store.xmrLabels || {};   // Monero subaddress labels (per wallet)
+    for(const k of Object.keys(data.xmrLabels)) store.xmrLabels[k] = Object.assign({}, data.xmrLabels[k], store.xmrLabels[k]); }
+  if(data.xmrRestore && typeof data.xmrRestore === 'object'){ store.settings = store.settings || {}; store.settings.xmrRestore = store.settings.xmrRestore || {};   // per-wallet Monero restore heights
+    for(const k of Object.keys(data.xmrRestore)) store.settings.xmrRestore[k] = Object.assign({}, data.xmrRestore[k], store.settings.xmrRestore[k]); }
+  if(data.mwebRestore && typeof data.mwebRestore === 'object'){ store.settings = store.settings || {}; store.settings.mwebRestore = store.settings.mwebRestore || {};   // per-wallet MWEB restore heights
+    for(const k of Object.keys(data.mwebRestore)) if(store.settings.mwebRestore[k] == null) store.settings.mwebRestore[k] = data.mwebRestore[k]; }
   if(Array.isArray(data.contacts)){ store.contacts = store.contacts || [];
     const addrs = new Set(store.contacts.map(c => c.address));
     for(const ct of data.contacts){ if(ct && ct.name && ct.address && !addrs.has(ct.address)){
@@ -860,6 +906,7 @@ function renderOnboarding(){
         el('div',{class:'row',style:'margin-top:8px'},
           el('button',{class:'btn',onclick:actCreate},'Create new wallet'),
           el('button',{class:'btn ghost',onclick:actImport},'Import recovery phrase'),
+          el('button',{class:'btn ghost',onclick:actWatchViewKey},'Watch a view key'),
           el('button',{class:'btn ghost',onclick:actRestoreBackup},'Restore from backup')),
         el('p',{class:'sub',style:'margin-top:16px'},'Need coins to practice with? Grab free test coins from ',
           el('a',{href:'https://cypherfaucet.com',target:'_blank',rel:'noopener'},'CypherFaucet'),'.'))),
@@ -868,6 +915,16 @@ function renderOnboarding(){
 
 /* ---- controls (wallet name, coin, address type) ---- */
 function renderControls(){
+  if(state.watchOnly){
+    return el('div',{class:'card'},
+      el('div',{class:'card-h'},
+        el('span',{}, state.wallet.name + ' (watch-only)'),
+        el('div',{class:'row',style:'flex:1;justify-content:flex-end;gap:8px'},
+          el('button',{class:'btn ghost sm',onclick:actBackup},'Backup'),
+          el('button',{class:'btn ghost sm',onclick:actWallets},'Wallets'),
+          el('button',{class:'btn ghost sm',onclick:actSettings},'Settings'))),
+      el('div',{class:'card-b'}, el('div',{class:'sub'},'Litecoin MWEB, watch-only (imported view key). You can see the balance and history and derive receive addresses, but cannot spend.')));
+  }
   const coinPills = el('div',{class:'pills'});
   for(const [key,c] of Object.entries(COINS)){
     const p = el('div',{class:'pill'+(key===state.coin?' active':'')+(c.enabled?'':' disabled'),
@@ -1696,7 +1753,7 @@ function txActions(t, c){
 /* ----------------------------- coin / type switching ----------------------------- */
 function mwebEnabled(){ return MWEB_ENABLED && state.mwebOk === true; }
 function isMweb(){ return state.coin === 'ltc' && state.ltcMweb === true && mwebEnabled(); }   // MWEB is an address-type within Litecoin, not a separate coin
-function switchCoin(coin){ if(!COINS[coin].enabled||coin===state.coin) return; state.coin=coin; _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); render(); refresh(); }
+function switchCoin(coin){ if(state.watchOnly) return; if(!COINS[coin].enabled||coin===state.coin) return; state.coin=coin; _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); render(); refresh(); }
 function switchType(type){ if(type===state.addrType && !state.ltcMweb) return; state.ltcMweb=false; state.addrType=type; saveSettings(); buildAddresses(); render(); refresh(); }
 function switchToMweb(){ if(isMweb()) return; state.ltcMweb=true; saveSettings(); buildAddresses(); render(); }   // enter MWEB mode on the Litecoin wallet
 function switchXmrNet(net){ if(net===state.xmrNet || !xmr.XMR_NETS[net] || state.xmr.syncing) return; state.xmrNet=net; state.xmrAccount=0;
@@ -1859,7 +1916,7 @@ async function moneroSync(){
       sx.restoreHeight = restoreHeight; sx.start = restoreHeight; sx.height = 0;
       if(!sx.endHeight && info && info.height) sx.endHeight = info.height;
       render();
-      console.log('[monero] node', nodeUrl, '· fresh sync from', restoreHeight);
+      console.debug('[monero] node', nodeUrl, '· fresh sync from', restoreHeight);
       wallet = await moneroEngine.openFromKeys({ network:net, nodeUrl, primaryAddress:primary,
         privateViewKey: xmr.hex(state.xmrKeys.viewBytes), privateSpendKey: xmr.hex(state.xmrKeys.spendBytes), restoreHeight });
     }
@@ -1988,7 +2045,7 @@ async function mwebSync(){
       fromH = restore;
     }
     mx.start = fromH; mx.height = fromH; render();
-    console.log('[mweb] node', node, '· scan', fromH, '->', tip.height);
+    console.debug('[mweb] node', node, '· scan', fromH, '->', tip.height);
     if(fromH <= tip.height){
       await mwebNode.scanRange(node, state.mwebKeys, fromH, tip.height, {
         gap:50, owned, spent, signal:_mwebAbort.signal,
@@ -2065,6 +2122,52 @@ function renderMwebRestore(){
       el('div',{class:'row',style:'flex:0;align-items:center'}, hInput, tipBtn),
       el('div',{}, applyBtn)));
 }
+function exportMwebViewKey(){
+  if(!state.mwebKeys || state.mwebKeys.watchOnly){ toast('No spendable MWEB keys to export.','warn'); return; }
+  let vk; try { vk = mweb.exportViewKey(state.mwebKeys); } catch(e){ toast('Export failed: '+(e.message||e),'bad'); return; }
+  const ta = el('textarea',{readonly:'',rows:'3',style:'width:100%;font-family:ui-monospace,monospace;font-size:12px;word-break:break-all'}); ta.value = vk;
+  const copyBtn = el('button',{class:'btn'},'Copy view key'); copyBtn.addEventListener('click',()=>copyText(vk,copyBtn,true));
+  const closeBtn = el('button',{class:'btn ghost'},'Close'); closeBtn.addEventListener('click',closeModal);
+  showModal(el('div',{class:'card',style:'max-width:520px'},
+    el('div',{class:'card-h'},'MWEB view key'),
+    el('div',{class:'card-b stack'},
+      el('div',{class:'msg warn'},'Anyone with this key can see the full MWEB balance and history of this wallet (every amount received or sent), but CANNOT spend. Share it only with someone you want to audit this wallet.'),
+      ta,
+      el('div',{class:'sub faint'},'A read-only key (65 bytes: scan secret + spend public key). It reveals every MWEB amount but cannot move funds - keep it private.'),
+      el('div',{class:'row',style:'flex:0'}, copyBtn, closeBtn))));
+}
+function actShieldToMweb(){
+  if(state.watchOnly){ toast('Watch-only wallet cannot spend.','warn'); return; }
+  const amtIn = el('input',{type:'text',inputmode:'decimal',placeholder:'amount in LTC',style:'max-width:200px'});
+  const feeIn = el('input',{type:'number',min:'1',value:'2',style:'max-width:120px'});
+  const msg = el('div',{});
+  const goBtn = el('button',{class:'btn'},'Shield');
+  goBtn.addEventListener('click', async ()=>{
+    const amt = Math.round((parseFloat(amtIn.value)||0)*1e8);
+    if(!(amt>0)){ clear(msg).append(el('div',{class:'msg bad'},'Enter a valid amount.')); return; }
+    const broadcastUrl = mwebBroadcastUrl();
+    if(!broadcastUrl){ clear(msg).append(el('div',{class:'msg warn'},'Set an MWEB helper in Settings first.')); return; }
+    goBtn.disabled=true; clear(msg).append(el('div',{class:'sub'},'Gathering Litecoin coins, building proof + peg-in…'));
+    try {
+      const r = await buildPegInTx(amt, Math.max(1, parseInt(feeIn.value,10)||1));
+      const dry = await mwebNode.testAccept(broadcastUrl, r.hex);
+      if(!(dry && dry.allowed)){ clear(msg).append(el('div',{class:'msg bad'},'Node rejected: ' + ((dry && dry['reject-reason'])||'unknown'))); goBtn.disabled=false; return; }
+      const txid = await mwebNode.broadcast(broadcastUrl, r.hex);
+      clear(msg).append(el('div',{class:'msg ok'},'Shielded ' + fmtMwebLtc(r.amount) + ' LTC. txid ', el('span',{class:'mono'}, txid)));
+      setTimeout(()=>{ const m2=state.mweb; if(m2){ m2.synced=false; m2._autoTried=false; } if(isMweb()) mwebSync(); }, 4000);
+    } catch(e){ clear(msg).append(el('div',{class:'msg bad'}, e.message||String(e))); }
+    finally { goBtn.disabled=false; }
+  });
+  const cancelBtn = el('button',{class:'btn ghost'},'Cancel'); cancelBtn.addEventListener('click', closeModal);
+  showModal(el('div',{class:'card',style:'max-width:520px'},
+    el('div',{class:'card-h'},'Shield Litecoin into MWEB'),
+    el('div',{class:'card-b stack'},
+      el('div',{class:'sub faint'},'Move transparent Litecoin testnet coins into your private MWEB balance (a peg-in to your own MWEB address). Costs a Litecoin network fee plus a fixed 2100-litoshi MWEB fee. This is new, so verify on testnet.'),
+      el('div',{class:'field'}, el('label',{class:'fld'},'Amount (LTC)'), amtIn),
+      el('div',{class:'field'}, el('label',{class:'fld'},'Litecoin fee rate (sat/vB)'), feeIn),
+      msg,
+      el('div',{class:'row',style:'flex:0'}, goBtn, cancelBtn))));
+}
 function renderMwebReceive(){
   const c = COINS[state.coin];
   if(!state.addresses.length) return el('div',{class:'card'}, el('div',{class:'card-b'}, el('div',{class:'msg bad'}, state.error || 'MWEB addresses unavailable.')));
@@ -2085,7 +2188,9 @@ function renderMwebReceive(){
       el('div',{class:'sub'}, primary.index===0 ? 'Primary MWEB address' : ('MWEB address ' + primary.index)),
       el('div',{class:'addr',style:'font-size:14px'}, primary.address),
       el('div',{class:'row',style:'flex:0;margin:6px 0 4px'}, copyAddr,
-        el('button',{class:'btn ghost sm',onclick:deriveNext},'Derive next address')),
+        el('button',{class:'btn ghost sm',onclick:deriveNext},'Derive next address'),
+        state.watchOnly ? null : el('button',{class:'btn ghost sm',onclick:exportMwebViewKey,title:'Share a read-only view key (audit balance + history, no spend)'},'Export view key'),
+        state.watchOnly ? null : el('button',{class:'btn ghost sm',onclick:actShieldToMweb,title:'Move transparent Litecoin into your MWEB balance (peg-in)'},'Shield from Litecoin')),
       el('div',{class:'sub faint'},'A tmweb stealth address (bech32). Send Litecoin testnet coins here over MWEB; your balance and history appear after you scan on the balance screen. Same recovery phrase as your Litecoin wallet, so MWEB funds restore in any MWEB-capable Litecoin wallet.'),
       el('hr',{class:'hr'}),
       el('div',{class:'sub'},'Your MWEB addresses'), list,
@@ -2114,53 +2219,77 @@ function renderMwebHistory(){
 
 function renderMwebSend(){
   const mx = state.mweb;
+  if(state.watchOnly) return el('div',{class:'card'}, el('div',{class:'card-b'}, el('div',{class:'msg warn'},'Watch-only wallet (imported view key): it can see the balance and receive, but cannot spend. Open the wallet from its recovery phrase to send.')));
   if(!mx.synced) return el('div',{class:'card'}, el('div',{class:'card-b'}, el('div',{class:'sub'}, mx.syncing ? 'Scanning…' : 'Connect and scan on the balance screen before sending.')));
   const spendable = []; if(mx.owned) for(const [id,u] of mx.owned) if(!mx.spent || !mx.spent.has(id)) spendable.push(u);
   const total = spendable.reduce((a,u)=>a+BigInt(u.value), 0n);
-  const s = state.mwebSend = state.mwebSend || { to:'', amount:'' };
-  // MWEB fees are DETERMINISTIC: fee = mweb_weight * BASE_MWEB_FEE (100 litoshi/weight unit). Weights (libmw):
-  // standard input 0, standard output 18, stealth kernel 3, + ceil(pegoutScript/42). A pure MWEB tx has no
+  const s = state.mwebSend = state.mwebSend || { recipients:[{to:'',amount:''}] };
+  if(!s.recipients) s.recipients = [{ to: s.to||'', amount: s.amount||'' }];   // migrate an old single-recipient draft
+  // MWEB fees are DETERMINISTIC: fee = mweb_weight * 100 (BASE_MWEB_FEE). Weights (libmw): input 0, output 18,
+  // stealth kernel 3, + ceil(pegoutScript/42) per peg-out (summed into pegoutWeight). A pure MWEB tx has no
   // canonical size, so the node's min-relay floor and max-fee ceiling are BOTH exactly weight*100 - the node
   // accepts that one value and nothing else (no rate market). So we compute it; there's nothing to tune.
-  const mwebTxFee = (mwebOuts, pegoutLen=0) => {
-    const weight = BigInt(mwebOuts)*18n + 3n + (pegoutLen ? BigInt(Math.ceil(pegoutLen/42)) : 0n);
+  const mwebTxFee = (mwebOuts, pegoutWeight=0) => {
+    const weight = BigInt(mwebOuts)*18n + 3n + BigInt(pegoutWeight);
     return { weight, fee: weight*100n };
   };
   const broadcastUrl = mwebBroadcastUrl();
   const toLitoshi = (str)=>{ const t=String(str).trim(); if(t===''||t==='.'||!/^\d*\.?\d*$/.test(t)) return null; const [i,f='']=t.split('.'); if(f.length>8) return null; return BigInt(i||'0')*100000000n + BigInt((f+'00000000').slice(0,8)); };
   const msg = el('div',{});
   const clearHex = ()=>{ s._hex=null; };
-  const toIn = el('input',{type:'text',placeholder:'tmweb1… or a Litecoin testnet address',value:s.to}); toIn.addEventListener('input', e=>{ s.to=e.target.value; clearHex(); updateFeeNote(); });
-  const scanBtn = el('button',{class:'btn ghost sm',title:'Scan a QR code',onclick:()=>scanModal(text=>{ const p=parseBip21(text); s.to = (p && p.address) ? p.address : String(text).trim(); s._hex=null; render(); })},'Scan');
-  const amtIn = el('input',{type:'text',inputmode:'decimal',placeholder:'amount in LTC',value:s.amount}); amtIn.addEventListener('input', e=>{ s.amount=e.target.value; clearHex(); });
+  // Parse one recipient row -> { kind:'mweb'|'pegout', value, recipient, pegW } | null (empty row). Throws on invalid.
+  function parseRow(r){
+    const toStr=(r.to||'').trim();
+    if(!toStr && !(r.amount||'').trim()) return null;
+    const amt = toLitoshi(r.amount);
+    if(amt==null || amt<=0n) throw new Error('Enter a valid amount for each recipient.');
+    const dst = mweb.decodeStealthAddress(toStr);
+    if(dst){ if(dst.hrp !== mweb.MWEB_HRP.testnet) throw new Error('That is a mainnet MWEB address (' + dst.hrp + '); this wallet is testnet only.'); return { kind:'mweb', value:amt, recipient:{ address:dst, value:amt } }; }
+    if(isValidAddress(toStr,'ltc')){ const script=btc.OutScript.encode(btc.Address(COINS.ltc.net).decode(toStr)); return { kind:'pegout', value:amt, pegW:Math.ceil(script.length/42), recipient:{ script, value:amt } }; }
+    throw new Error('Enter a valid tmweb or Litecoin testnet address for each recipient.');
+  }
   const feeNote = el('div',{class:'sub'});
-  function updateFeeNote(){
-    const toStr=(s.to||'').trim(); const dst=mweb.decodeStealthAddress(toStr);
-    const isPeg = !dst && isValidAddress(toStr,'ltc');
-    let pegLen=0; if(isPeg){ try{ pegLen=btc.OutScript.encode(btc.Address(COINS.ltc.net).decode(toStr)).length; }catch(_){ pegLen=25; } }
-    const { weight, fee } = mwebTxFee((isPeg?0:1)+1, pegLen);
+  function updateFeeNote(){   // assume a change output (the common case)
+    let mwebOuts=0, pegW=0;
+    for(const r of s.recipients){ try{ const p=parseRow(r); if(!p) continue; if(p.kind==='mweb') mwebOuts++; else pegW+=p.pegW; }catch(_){} }
+    const { weight, fee } = mwebTxFee(mwebOuts+1, pegW);
     clear(feeNote).append(el('span',{class:'mono'}, fmtMwebLtc(fee) + ' LTC'), ' (' + fee + ' litoshi), set automatically. MWEB fees are fixed by weight (' + weight + ' x 100 litoshi), not a rate you tune.');
   }
+  const rowsWrap = el('div',{class:'stack'});
+  function renderRows(){
+    clear(rowsWrap);
+    s.recipients.forEach((r,i)=>{
+      const toIn=el('input',{type:'text',placeholder:'tmweb1… or a Litecoin testnet address',value:r.to}); toIn.addEventListener('input',e=>{ r.to=e.target.value; clearHex(); updateFeeNote(); });
+      const scanB=el('button',{class:'btn ghost sm',title:'Scan a QR code',onclick:()=>scanModal(text=>{ const p=parseBip21(text); r.to=(p&&p.address)?p.address:String(text).trim(); s._hex=null; render(); })},'Scan');
+      const amtIn=el('input',{type:'text',inputmode:'decimal',placeholder:'amount in LTC',value:r.amount,style:'max-width:170px'}); amtIn.addEventListener('input',e=>{ r.amount=e.target.value; clearHex(); updateFeeNote(); });
+      const rm = s.recipients.length>1 ? el('button',{class:'btn ghost sm',title:'Remove recipient',onclick:()=>{ s.recipients.splice(i,1); clearHex(); renderRows(); updateFeeNote(); }},'✕') : null;
+      rowsWrap.append(el('div',{class:'field'},
+        el('label',{class:'fld'}, (s.recipients.length>1?('Recipient '+(i+1)):'To')+' (tmweb, or a Litecoin address to peg-out)'),
+        el('div',{class:'row',style:'align-items:center'}, toIn, scanB),
+        el('div',{class:'row',style:'align-items:center;margin-top:4px'}, amtIn, el('span',{class:'sub faint'},'LTC'), rm)));
+    });
+  }
+  renderRows();
+  const addBtn = el('button',{class:'btn ghost sm',onclick:()=>{ s.recipients.push({to:'',amount:''}); renderRows(); updateFeeNote(); }},'+ Add recipient');
   async function build(){
-    const amt = toLitoshi(s.amount);
-    if(amt==null || amt<=0n) throw new Error('Enter a valid amount.');
-    const toStr = (s.to||'').trim();
-    const dest = mweb.decodeStealthAddress(toStr);
-    let recipient, pegLen = 0, isPeg = false;
-    if(dest) recipient = { address: dest, value: amt };                                  // MWEB -> MWEB
-    else if(isValidAddress(toStr, 'ltc')){ const script = btc.OutScript.encode(btc.Address(COINS.ltc.net).decode(toStr)); pegLen = script.length; isPeg = true; recipient = { script, value: amt }; }   // peg-out
-    else throw new Error('Enter a valid tmweb or Litecoin testnet address.');
-    // MWEB fee is deterministic (weight x 100); assume a change output, recompute without it if coins come out exact.
-    const feeFor = (withChange) => mwebTxFee((isPeg ? 0 : 1) + (withChange ? 1 : 0), pegLen).fee;
-    let fee = feeFor(true);
-    if(amt+fee > total) throw new Error('Insufficient MWEB balance (' + fmtMwebLtc(total) + ' LTC spendable).');
+    const parsed=[]; for(const r of s.recipients){ const p=parseRow(r); if(p) parsed.push(p); }
+    if(!parsed.length) throw new Error('Add at least one recipient.');
+    const outAmount = parsed.reduce((a,p)=>a+p.value, 0n);
+    const mwebOuts = parsed.filter(p=>p.kind==='mweb').length;
+    const pegW = parsed.reduce((a,p)=>a+(p.kind==='pegout'?p.pegW:0), 0);
+    const feeFor = (withChange) => mwebTxFee(mwebOuts + (withChange ? 1 : 0), pegW).fee;
+    const feeWc = feeFor(true), feeNc = feeFor(false);   // MWEB fees are EXACT (weight*100); with-change vs no-change differ by one output's weight
+    if(outAmount + feeNc > total) throw new Error('Insufficient MWEB balance (' + fmtMwebLtc(total) + ' LTC spendable).');
     const sorted = spendable.slice().sort((a,b)=> (BigInt(a.value) < BigInt(b.value) ? -1 : 1));   // smallest-first selection
-    const sel=[]; let acc=0n; for(const u of sorted){ sel.push(u); acc+=BigInt(u.value); if(acc>=amt+fee) break; }
-    if(acc < amt+fee) throw new Error('Could not select enough coins.');
-    let change = acc - amt - fee;
-    if(change <= 0n){ fee = feeFor(false); change = acc - amt - fee; if(change < 0n) throw new Error('Insufficient MWEB balance for amount + fee.'); }
-    const recipients = [recipient];
-    if(change > 0n){ const ch = mweb.stealthAddress(state.mwebKeys, 0); recipients.push({ address:{ scan:ch.Abytes, spend:ch.Bbytes }, value: change }); }   // change always stays in MWEB (our index-0 address)
+    const sel=[]; let acc=0n; for(const u of sorted){ sel.push(u); acc+=BigInt(u.value); if(acc>=outAmount+feeWc) break; }   // aim to afford a change output
+    let fee, change, withChange;
+    const cWc = acc - outAmount - feeWc;
+    if(cWc > 0n){ fee = feeWc; change = cWc; withChange = true; }                                // normal: recipients + change
+    else if(acc - outAmount - feeNc === 0n){ fee = feeNc; change = 0n; withChange = false; }     // exact spend, no change output
+    else if(acc < outAmount + feeNc) throw new Error('Insufficient MWEB balance for amount + fee.');
+    else throw new Error('Cannot send this exact amount: MWEB fees are fixed, so the ' + (acc - outAmount - feeNc) + ' litoshi left over is too small for a change output. Lower the amount by up to ' + (feeWc - feeNc) + ' litoshi.');
+    const recipients = parsed.map(p=>p.recipient);
+    if(withChange){ const ch = mweb.stealthAddress(state.mwebKeys, 0); recipients.push({ address:{ scan:ch.Abytes, spend:ch.Bbytes }, value: change }); }   // change stays in MWEB (index-0 address)
     const coins = sel.map(u=>({ output_id:u.output_id, value:u.value, blind:u.blind, spendKey:u.spendKey }));
     return mweb.buildTransaction({ coins, recipients, fee });
   }
@@ -2177,10 +2306,12 @@ function renderMwebSend(){
   const sendBtn = el('button',{class:'btn'}, '↑ Send');
   sendBtn.addEventListener('click', ()=>{
     if(!broadcastUrl){ toast('Set an MWEB broadcast endpoint in Settings first.','warn'); return; }
-    confirmModal('Send ' + (s.amount||'?') + ' LTC over MWEB? Testnet only - no real value.', async ()=>{
+    let totalStr; try { totalStr = fmtMwebLtc(s.recipients.reduce((a,r)=>{ const v=toLitoshi(r.amount); return a+(v||0n); },0n)); } catch(_){ totalStr='?'; }
+    const nRec = s.recipients.filter(r=>(r.to||'').trim()).length;
+    confirmModal('Send ' + totalStr + ' LTC over MWEB to ' + nRec + ' recipient(s)? Testnet only - no real value.', async ()=>{
       sendBtn.disabled=true; clear(msg).append(el('div',{class:'sub'},'Building range proof + broadcasting…'));
       try { const hex = s._hex || await build(); const txid = await mwebNode.broadcast(broadcastUrl, hex);
-        s._hex=null; s.amount=''; s.to='';
+        s._hex=null; s.recipients=[{to:'',amount:''}];
         clear(msg).append(el('div',{class:'msg ok'}, 'Broadcast. txid ', el('span',{class:'mono'}, txid)));
         setTimeout(()=>{ const m2=state.mweb; if(m2){ m2.synced=false; m2._autoTried=false; } if(isMweb()) mwebSync(); }, 3000);   // re-scan to reflect the spend
       } catch(e){ clear(msg).append(el('div',{class:'msg bad'}, e.message||String(e))); }
@@ -2191,10 +2322,10 @@ function renderMwebSend(){
   return el('div',{class:'card'},
     el('div',{class:'card-h'}, 'Send MWEB', el('span',{class:'sub'}, fmtMwebLtc(total) + ' LTC spendable · testnet')),
     el('div',{class:'card-b stack'},
-      el('div',{class:'field'}, el('label',{class:'fld'},'To (tmweb, or a Litecoin address to peg-out)'), el('div',{class:'row',style:'align-items:center'}, toIn, scanBtn)),
-      el('div',{class:'field'}, el('label',{class:'fld'},'Amount (LTC)'), amtIn),
+      rowsWrap,
+      el('div',{style:'margin:-2px 0 2px'}, addBtn),
       el('div',{class:'field'}, el('label',{class:'fld'},'Network fee'), feeNote),
-      el('div',{class:'sub faint'},'Send to a tmweb address to stay private, or to a regular Litecoin testnet address to peg-out (the node settles that to a transparent output). A 64-bit range proof is built in your browser (a small prover loads once), then broadcast through your node. Always Check (dry-run) first. Sending is new, so verify on testnet.'),
+      el('div',{class:'sub faint'},'Send to tmweb addresses to stay private, or to regular Litecoin testnet addresses to peg-out (the node settles those to transparent outputs). A 64-bit range proof is built in your browser per MWEB output (a small prover loads once), then broadcast through your node. Always Check (dry-run) first. Sending is new, so verify on testnet.'),
       broadcastUrl ? null : el('div',{class:'msg warn'},'Set a Litecoin MWEB helper in Settings (deploy tools/mweb.php) to enable sending.'),
       el('div',{class:'row',style:'flex:0'}, dryBtn, sendBtn),
       msg,
@@ -2419,17 +2550,22 @@ function actRestoreBackup(){
 }
 /* backup (reveal phrase + export/import file) */
 function actBackup(){
-  const revealBtn = el('button',{class:'btn ghost sm'},'Reveal recovery phrase');
+  const isWatch = !!(state.wallet && state.wallet.viewKey);
+  const revealBtn = el('button',{class:'btn ghost sm'}, isWatch ? 'Reveal view key' : 'Reveal recovery phrase');
   const holder = el('div',{});
-  revealBtn.addEventListener('click', ()=>{ clear(holder).append(seedGrid(state.wallet.mnemonic));
-    if(state.wallet.passphrase) holder.append(el('div',{class:'msg warn'},'This wallet also has a passphrase set. You need both the phrase and the passphrase to restore it.'));
+  revealBtn.addEventListener('click', ()=>{
+    if(isWatch){ const ta=el('textarea',{readonly:'',rows:'3',style:'width:100%;font-family:ui-monospace,monospace;font-size:12px;word-break:break-all'}); ta.value=state.wallet.viewKey; clear(holder).append(ta, el('div',{class:'sub faint'},'A read-only view key (no spend power).')); }
+    else { clear(holder).append(seedGrid(state.wallet.mnemonic));
+      if(state.wallet.passphrase) holder.append(el('div',{class:'msg warn'},'This wallet also has a passphrase set. You need both the phrase and the passphrase to restore it.')); }
     revealBtn.remove(); });
   const exportFull = el('button',{class:'btn'},'Export full backup');
   exportFull.addEventListener('click', exportSnapshot);
   const exportOne = el('button',{class:'btn ghost'},'This wallet only');
   exportOne.addEventListener('click', ()=>{
-    const data = { type:'testnetwallet-backup', version:1, name:state.wallet.name, mnemonic:state.wallet.mnemonic, passphrase:state.wallet.passphrase || '',
-      ...(isElectrum(state.wallet) ? { scheme:state.wallet.scheme, xprv:state.wallet.xprv } : {}) };
+    const data = state.wallet.viewKey
+      ? { type:'testnetwallet-backup', version:1, name:state.wallet.name, viewKey:state.wallet.viewKey }
+      : { type:'testnetwallet-backup', version:1, name:state.wallet.name, mnemonic:state.wallet.mnemonic, passphrase:state.wallet.passphrase || '',
+          ...(isElectrum(state.wallet) ? { scheme:state.wallet.scheme, xprv:state.wallet.xprv } : {}) };
     downloadBlob(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}), 'testnetwallet-'+state.wallet.name.replace(/\W+/g,'_')+'.json');
   });
   const fileInput = el('input',{type:'file',accept:'application/json,.json',style:'display:none'});
@@ -2482,7 +2618,7 @@ function actWallets(editId){
         if(state.wallet && state.wallet.id===w.id){
           const next = (store.wallets||[])[0];
           if(next){ openWallet(next); actWallets(); }
-          else { store.activeId=null; saveStore(); state.wallet=null; state.master=null; closeModal(); render(); }
+          else { store.activeId=null; saveStore(); state.wallet=null; state.master=null; state.xmrKeys=null; state.mwebKeys=null; state.mwebSend=null; state.watchOnly=false; state.addresses=[]; state.balances={}; state.txs=[]; closeModal(); render(); }
         } else { actWallets(); }
       }, {danger:true, yes:'Forget', title:'Forget wallet', onNo:()=>actWallets()}); });
       left = el('div',{class:'row',style:'align-items:center;flex:1;gap:8px'}, el('span',{style:'flex:1'}, w.name), rename, forget);
@@ -2498,6 +2634,7 @@ function actWallets(editId){
       el('div',{class:'row',style:'margin-top:8px'},
         el('button',{class:'btn',onclick:()=>{ closeModal(); actCreate(); }},'+ Create new'),
         el('button',{class:'btn ghost',onclick:()=>{ closeModal(); actImport(); }},'Import phrase'),
+        el('button',{class:'btn ghost',onclick:()=>{ closeModal(); actWatchViewKey(); }},'Watch view key'),
       ),
       el('div',{class:'row',style:'margin-top:4px'}, el('button',{class:'btn ghost',onclick:closeModal},'Close')),
     )));
@@ -2598,6 +2735,50 @@ async function gatherInputs(coin, type){
     }
   }
   return out;
+}
+// Gather the wallet's transparent Litecoin UTXOs (across address types) + the keys that sign them, for a peg-in.
+async function gatherLtcInputs(){
+  const net = COINS.ltc.net, out = [], n = Math.max(addrCount(), 10);
+  for(const type of ['wpkh','sh-wpkh','pkh','tr']){
+    for(let i=0;i<n;i++){
+      const node = deriveNode(type, i), pub = node.publicKey, addr = addrFromPub(pub, 'ltc', type);
+      let utxos=[]; try { utxos = await getUtxos('ltc', addr); } catch(_){ continue; }
+      for(const u of utxos){
+        const base = { txid:u.txid, index:u.vout, sequence:0xfffffffd };
+        let inp;
+        if(type==='wpkh') inp = { ...base, witnessUtxo:{ script: btc.p2wpkh(pub, net).script, amount: BigInt(u.value) } };
+        else if(type==='sh-wpkh'){ const w = btc.p2sh(btc.p2wpkh(pub, net), net); inp = { ...base, witnessUtxo:{ script:w.script, amount:BigInt(u.value) }, redeemScript:w.redeemScript }; }
+        else if(type==='tr'){ const xo = pub.slice(1); inp = { ...base, tapInternalKey:xo, witnessUtxo:{ script: btc.p2tr(xo, undefined, net).script, amount:BigInt(u.value) } }; }
+        else { try { inp = { ...base, nonWitnessUtxo: hexToBytes(await getPrevTxHex('ltc', u.txid)) }; } catch(_){ continue; } }
+        out.push({ inp, key: node.privateKey, value: u.value, confirmed: !!(u.status && u.status.confirmed) });
+      }
+    }
+  }
+  return out;
+}
+// Peg-in: shield `amountSats` transparent LTC into MWEB (to the wallet's own primary MWEB address). Builds the MWEB
+// extension + a signed transparent LTC tx (inputs -> peg-in output + LTC change), then splices them. Returns { hex, ... }.
+async function buildPegInTx(amountSats, ltcRate){
+  if(state.watchOnly) throw new Error('Watch-only wallet cannot spend.');
+  const net = COINS.ltc.net, amount = BigInt(amountSats);
+  const primary = state.addresses[state.addresses.length-1];          // our own primary MWEB address
+  const dest = mweb.decodeStealthAddress(primary.address);
+  if(!dest) throw new Error('Could not derive your MWEB address');
+  const mwebFee = (1n*18n + 3n) * 100n;                               // 1 MWEB output (recipient), no MWEB change, 1 stealth kernel = weight 21
+  const pegin = amount + mwebFee;
+  const { mwTx, peginScript } = await mweb.buildPegInMweb({ recipients:[{ address:{ scan:dest.scan, spend:dest.spend }, value: amount }], fee: mwebFee, pegin });
+  const cand = (await gatherLtcInputs()).filter(c=>c.confirmed);
+  if(!cand.length) throw new Error('No confirmed transparent Litecoin coins to shield. Receive tLTC to a Litecoin (non-MWEB) address first.');
+  const changeAddr = addrFromPub(deriveNode('wpkh', 0).publicKey, 'ltc', 'wpkh');
+  const sel = btc.selectUTXO(cand.map(c=>c.inp), [{ script: peginScript, amount: pegin }], 'default', {
+    changeAddress: changeAddr, feePerByte: BigInt(Math.max(1, ltcRate)), dust: BigInt(DUST),
+    network: net, createTx: true, allowUnknownOutputs: true,
+  });
+  if(!sel || !sel.tx) throw new Error('Not enough Litecoin to cover ' + (Number(pegin)/1e8) + ' LTC + fee.');
+  const signed = new Set();
+  for(const c of cand){ const kh = bytesToHex(c.key); if(signed.has(kh)) continue; signed.add(kh); try { sel.tx.sign(c.key); } catch(_){} }
+  sel.tx.finalize();
+  return { hex: mweb.spliceMwebIntoTx(hexToBytes(sel.tx.hex), mwTx), pegin, mwebFee, ltcFee: Number(sel.fee), amount };
 }
 function opReturnScript(send){
   if(!send.opReturn.trim()) return null;
