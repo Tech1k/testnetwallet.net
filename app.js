@@ -43,8 +43,8 @@ const COINS = {
         explorer:'https://mempool.space/testnet4' },
   ltc:{ name:'Litecoin', ticker:'tLTC', priceSym:'LTC', color:'#345d9d', enabled:true, uri:'litecoin',
         msgPrefix:'Litecoin Signed Message:\n',
-        net: LTC_TESTNET, api:'https://litecoinspace.org/testnet/api',
-        explorer:'https://litecoinspace.org/testnet' },
+        net: LTC_TESTNET, api:'https://testnetscan.com/ltc/testnet/api',   // self-hosted electrs-ltc Esplora API (see testnetscan.com/docs)
+        explorer:'https://testnetscan.com/ltc/testnet' },
   xmr:{ name:'Monero', ticker:'XMR', priceSym:'XMR', color:'#ff6600', enabled:false, uri:'monero', addrModel:'monero',
         explorers:{ stagenet:'https://xmr-stagenet.librenode.com', testnet:'https://xmr-testnet.librenode.com' } }, // keys are pure-JS; balance/history/send/sign run through the lazy-loaded node engine. enabled set true at boot iff self-test passes.
 };
