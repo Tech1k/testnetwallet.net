@@ -274,28 +274,30 @@ function isValidAddress(addr, coin){
 /* ----------------------------- Esplora data layer ----------------------------- */
 // Base URL for a coin's Esplora API: a user-set self-hosted override (Settings) or the built-in default.
 function apiBase(coin){ return (store.settings && store.settings.api && store.settings.api[coin]) || COINS[coin].api; }
-async function apiGet(coin, path){
+async function apiGet(coin, path, signal){
   const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 12000);
+  const onAbort = () => ac.abort('superseded');                          // let a caller (e.g. a superseded scan) cancel this in-flight request
+  if(signal){ if(signal.aborted) ac.abort('superseded'); else signal.addEventListener('abort', onAbort, { once:true }); }
   try {
     const r = await fetch(apiBase(coin) + path, { signal: ac.signal });
     if(!r.ok) throw new Error('HTTP '+r.status);
     const ct = r.headers.get('content-type') || '';
     if(!ct.includes('json')) throw new Error('unexpected response');
     return await r.json();
-  } finally { clearTimeout(t); }
+  } finally { clearTimeout(t); if(signal) signal.removeEventListener('abort', onAbort); }
 }
-async function getStats(coin, addr){
-  const s = await apiGet(coin, '/address/'+encodeURIComponent(addr));
+async function getStats(coin, addr, signal){
+  const s = await apiGet(coin, '/address/'+encodeURIComponent(addr), signal);
   const cs = s.chain_stats || {}, ms = s.mempool_stats || {};
   const confirmed = (cs.funded_txo_sum||0) - (cs.spent_txo_sum||0);
   const pending   = (ms.funded_txo_sum||0) - (ms.spent_txo_sum||0);
   return { confirmed, total: confirmed + pending };
 }
 const TX_PAGE_CAP = 5;          // Esplora returns ~25 confirmed txs per chain page; cap pages/address to bound requests
-async function getTxs(coin, addr){
+async function getTxs(coin, addr, signal){
   let all = [], lastSeen = null;
   for(let page=0; page<TX_PAGE_CAP; page++){
-    const txs = await apiGet(coin, '/address/'+encodeURIComponent(addr)+'/txs'+(lastSeen ? '/chain/'+lastSeen : ''));
+    const txs = await apiGet(coin, '/address/'+encodeURIComponent(addr)+'/txs'+(lastSeen ? '/chain/'+lastSeen : ''), signal);
     if(!Array.isArray(txs)) throw new Error('bad tx response');
     all = all.concat(txs);
     const confirmed = txs.filter(t => t.status && t.status.confirmed);
@@ -806,24 +808,31 @@ async function discoverAddresses(ck){
 }
 
 /* ----------------------------- data refresh (race-guarded) ----------------------------- */
+let _refreshAbort = null, _refreshBusy = false, _refreshPending = false, _refreshCtx = null;
 async function refresh(){
   if(!state.wallet) return;
   if(COINS[state.coin].addrModel === 'monero' || isMweb()){ state.loading = false; state.error = null; renderStatus(); return; }   // Monero + MWEB use their own client-side scanners, not Esplora
   const ck = state.wallet.id+'|'+state.coin+'|'+state.addrType+'|'+state.account;
   if(!_discovered.has(ck)){ _discovered.add(ck); discoverAddresses(ck); }   // one-time gap-limit discovery per context (retries itself if superseded)
+  if(_refreshBusy){                                                         // a scan is already in flight:
+    if(ck === _refreshCtx){ _refreshPending = true; return; }               //   same context -> coalesce into one trailing pass, do not stack overlapping scans
+    if(_refreshAbort) _refreshAbort.abort('context-changed');              //   context changed -> cancel the stale scan's in-flight requests
+  }
+  _refreshBusy = true; _refreshCtx = ck; _refreshPending = false;
+  const ab = _refreshAbort = new AbortController();                         // this scan's requests hang off ab.signal so the next refresh can cancel them
   const seq = ++state.refreshSeq;
   state.loading = true; renderStatus();
   const addrs = state.addresses.map(a => a.address);
   const addrSet = new Set(addrs);
   try {
-    const statsList = await pmap(addrs, a => getStats(state.coin, a).then(s=>[a,s]).catch(()=>[a,null]), 8);
+    const statsList = await pmap(addrs, a => getStats(state.coin, a, ab.signal).then(s=>[a,s]).catch(()=>[a,null]), 8);
     if(seq !== state.refreshSeq) return;                 // a newer refresh superseded us
     let total = 0, confirmed = 0, ok = 0;
     for(const [a,s] of statsList){ if(!s) continue; ok++; state.balances[a] = s; total += s.total; confirmed += s.confirmed; }
     state.totalSats = total; state.confirmedSats = confirmed;
     if(ok === 0 && addrs.length) throw new Error('network unreachable');
 
-    const txLists = await pmap(addrs, a => getTxs(state.coin, a).catch(()=>[]), 8);
+    const txLists = await pmap(addrs, a => getTxs(state.coin, a, ab.signal).catch(()=>[]), 8);
     if(seq !== state.refreshSeq) return;
     const seen = new Map();
     for(const list of txLists) for(const tx of list){
@@ -849,7 +858,10 @@ async function refresh(){
     if(seq !== state.refreshSeq) return;
     state.error = e.message || String(e);
   } finally {
-    if(seq === state.refreshSeq){ state.loading = false; render(); }
+    if(seq === state.refreshSeq){
+      _refreshBusy = false; state.loading = false; render();
+      if(_refreshPending){ _refreshPending = false; refresh(); }            // a same-context refresh arrived mid-scan -> run one fresh pass now
+    }
   }
   getPrice(COINS[state.coin].priceSym, state.fiat).then(p => { if(seq===state.refreshSeq){ state.price = p; render(); } });
   getTipHeight(state.coin).then(h => { if(seq===state.refreshSeq && h){ state.tipHeight = h; render(); } });
