@@ -2148,12 +2148,56 @@ function exportMwebViewKey(){
       el('div',{class:'sub faint'},'A read-only key (65 bytes: scan secret + spend public key). It reveals every MWEB amount but cannot move funds - keep it private.'),
       el('div',{class:'row',style:'flex:0'}, copyBtn, closeBtn))));
 }
+// mwebscan.com MWEB privacy-analysis API (testnet). PRIVACY: only aggregate/generic endpoints are used, and NO user
+// amount or address is ever sent - the coach fetches the public peg-in amount distribution once and assesses locally.
+const MWEBSCAN_API = 'https://testnet.mwebscan.com/api';
+// Fetch mwebscan's public aggregate peg data ONCE - generic endpoints only, so no user amount or address is ever sent.
+async function mwebscanData(){
+  const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 8000);
+  try {
+    const j = u => fetch(MWEBSCAN_API + u, { signal: ac.signal }).then(r => r.ok ? r.json() : null).catch(()=>null);
+    const [rec, dist] = await Promise.all([ j('/recommendations'), j('/pegin_amounts?limit=500') ]);
+    const R = (rec && rec.recommendations) || {};
+    const toMap = (rows, key) => { const m = new Map(); for(const x of rows || []) m.set(Number(x.amount).toFixed(1), Number(x[key])||0); return m; };
+    const pegin  = { best: R.best_pegin_amounts  || [], dist: toMap((dist && dist.pegin_amounts) || [], 'count') };      // full peg-in distribution
+    const pegout = { best: R.best_pegout_amounts || [], dist: toMap(R.best_pegout_amounts || [], 'anonymity_set') };     // no /pegout_amounts endpoint -> the recommended set is the lookup
+    return (pegin.best.length || pegin.dist.size || pegout.best.length) ? { pegin, pegout } : false;   // no data -> unavailable (coaches hide)
+  } finally { clearTimeout(t); }
+}
+// Reproduce mwebscan's 0.1-tLTC bucketing locally so the typed amount never leaves the browser. label = 'peg-in' | 'peg-out'.
+function mwebscanAssess(amountLtc, data, label){
+  if(!(amountLtc > 0) || !data) return null;
+  const rounded = (Math.round(amountLtc * 10) / 10).toFixed(1);
+  const set = data.dist.get(rounded) || 0;
+  if(set >= 10) return { rounded, set, level:'ok',   note:'blends with ' + set + ' other ' + label + 's' };
+  if(set >= 2)  return { rounded, set, level:'warn', note:'only ' + set + ' others used ~' + rounded + ' tLTC (more linkable)' };
+  return { rounded, set, level:'bad', note:'uncommon amount; uniquely identifiable (pick a recommended one)' };
+}
 function actShieldToMweb(){
   if(state.watchOnly){ toast('Watch-only wallet cannot spend.','warn'); return; }
   const amtIn = el('input',{type:'text',inputmode:'decimal',placeholder:'amount in LTC',style:'max-width:200px'});
   const feeIn = el('input',{type:'number',min:'1',value:'2',style:'max-width:120px'});
   const msg = el('div',{});
   const goBtn = el('button',{class:'btn'},'Shield');
+  const coach = el('div',{class:'sub',style:'min-height:1.2em'});
+  let _coach = null;                                            // null = loading, false = unavailable, object = data
+  const renderCoach = ()=>{
+    clear(coach);
+    if(_coach === null){ coach.append(el('span',{class:'faint'},'Checking MWEB anonymity sets…')); return; }
+    if(!_coach) return;                                         // mwebscan unreachable -> coach stays hidden, Shield still works
+    const chips = el('div',{class:'row',style:'flex-wrap:wrap;gap:6px;flex:0;align-items:center'}, el('span',{class:'faint'},'Blend in: '));
+    for(const r of _coach.best.slice(0,6)){
+      const b = el('button',{class:'btn ghost sm',type:'button',title:r.anonymity_set + ' peg-ins used this amount'}, String(r.amount));
+      b.addEventListener('click', ()=>{ amtIn.value = String(r.amount); renderCoach(); });
+      chips.append(b);
+    }
+    coach.append(chips);
+    const a = mwebscanAssess(parseFloat(amtIn.value)||0, _coach, 'peg-in');
+    if(a) coach.append(el('div',{class:'msg ' + a.level,style:'margin-top:6px'}, '~' + a.rounded + ' tLTC: ' + a.note));
+    coach.append(el('div',{class:'sub faint',style:'margin-top:4px'}, 'Privacy data via ', el('a',{href:'https://testnet.mwebscan.com',target:'_blank',rel:'noopener'},'mwebscan ↗')));
+  };
+  amtIn.addEventListener('input', renderCoach);
+  mwebscanData().then(d=>{ _coach = d && d.pegin; renderCoach(); }).catch(()=>{ _coach = false; renderCoach(); });
   goBtn.addEventListener('click', async ()=>{
     const amt = Math.round((parseFloat(amtIn.value)||0)*1e8);
     if(!(amt>0)){ clear(msg).append(el('div',{class:'msg bad'},'Enter a valid amount.')); return; }
@@ -2176,6 +2220,7 @@ function actShieldToMweb(){
     el('div',{class:'card-b stack'},
       el('div',{class:'sub faint'},'Move transparent Litecoin testnet coins into your private MWEB balance (a peg-in to your own MWEB address). Costs a Litecoin network fee plus a fixed 2100-litoshi MWEB fee. This is new, so verify on testnet.'),
       el('div',{class:'field'}, el('label',{class:'fld'},'Amount (LTC)'), amtIn),
+      coach,
       el('div',{class:'field'}, el('label',{class:'fld'},'Litecoin fee rate (sat/vB)'), feeIn),
       msg,
       el('div',{class:'row',style:'flex:0'}, goBtn, cancelBtn))));
@@ -2266,7 +2311,31 @@ function renderMwebSend(){
     for(const r of s.recipients){ try{ const p=parseRow(r); if(!p) continue; if(p.kind==='mweb') mwebOuts++; else pegW+=p.pegW; }catch(_){} }
     const { weight, fee } = mwebTxFee(mwebOuts+1, pegW);
     clear(feeNote).append(el('span',{class:'mono'}, fmtMwebLtc(fee) + ' LTC'), ' (' + fee + ' litoshi), set automatically. MWEB fees are fixed by weight (' + weight + ' x 100 litoshi), not a rate you tune.');
+    updatePegoutCoach();
   }
+  const pegoutCoach = el('div',{});
+  let _pegoutData = null;                        // null = loading, false = unavailable, object = mwebscan peg-out data
+  function updatePegoutCoach(){                   // peg-out privacy coach - shown only for transparent (peg-out) recipients
+    clear(pegoutCoach);
+    if(!_pegoutData) return;                      // loading / unavailable -> nothing shown
+    const pegouts = []; s.recipients.forEach((r,i)=>{ if(isValidAddress((r.to||'').trim(),'ltc')) pegouts.push({ r, i }); });
+    if(!pegouts.length) return;                   // no transparent recipients -> a pure MWEB->MWEB send is already private
+    const box = el('div',{class:'field',style:'gap:4px'}, el('label',{class:'fld'},'MWEB peg-out privacy'));
+    const chips = el('div',{class:'row',style:'flex-wrap:wrap;gap:6px;flex:0;align-items:center'}, el('span',{class:'faint'},'Blend in: '));
+    for(const rec of _pegoutData.best.slice(0,6)){
+      const b = el('button',{class:'btn ghost sm',type:'button',title:rec.anonymity_set + ' peg-outs used this amount'}, String(rec.amount));
+      b.addEventListener('click', ()=>{ pegouts[0].r.amount = String(rec.amount); clearHex(); renderRows(); updateFeeNote(); });
+      chips.append(b);
+    }
+    box.append(chips);
+    for(const { r, i } of pegouts){
+      const a = mwebscanAssess(parseFloat(r.amount)||0, _pegoutData, 'peg-out');
+      if(a) box.append(el('div',{class:'msg ' + a.level,style:'margin-top:2px'}, (s.recipients.length>1 ? ('Recipient ' + (i+1) + ' ') : '') + '~' + a.rounded + ' tLTC: ' + a.note));
+    }
+    box.append(el('div',{class:'sub faint'},'Privacy data via ', el('a',{href:'https://testnet.mwebscan.com',target:'_blank',rel:'noopener'},'mwebscan ↗')));
+    pegoutCoach.append(box);
+  }
+  mwebscanData().then(d=>{ _pegoutData = d && d.pegout; updatePegoutCoach(); }).catch(()=>{ _pegoutData = false; updatePegoutCoach(); });
   const rowsWrap = el('div',{class:'stack'});
   function renderRows(){
     clear(rowsWrap);
@@ -2336,6 +2405,7 @@ function renderMwebSend(){
     el('div',{class:'card-b stack'},
       rowsWrap,
       el('div',{style:'margin:-2px 0 2px'}, addBtn),
+      pegoutCoach,
       el('div',{class:'field'}, el('label',{class:'fld'},'Network fee'), feeNote),
       el('div',{class:'sub faint'},'Send to tmweb addresses to stay private, or to regular Litecoin testnet addresses to peg-out (the node settles those to transparent outputs). A 64-bit range proof is built in your browser per MWEB output (a small prover loads once), then broadcast through your node. Always Check (dry-run) first. Sending is new, so verify on testnet.'),
       broadcastUrl ? null : el('div',{class:'msg warn'},'Set a Litecoin MWEB helper in Settings (deploy tools/mweb.php) to enable sending.'),

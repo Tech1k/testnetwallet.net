@@ -2,8 +2,8 @@
 # These belong as real HTTP headers; the in-page <meta> CSP and JS frame-buster are fallbacks.
 /*
 # 'wasm-unsafe-eval' is for the Monero WASM; 'unsafe-eval' is required by monero-ts's runtime new Function() env-detection; worker-src for its web worker. (Roadmap: isolate the Monero engine on its own origin to drop 'unsafe-eval'.)
-# connect-src lists the default Monero nodes, the Litecoin MWEB (Core REST) node, and the self-hosted testnetscan.com Esplora API/explorer (apex + subdomains); if you self-host any, add its origin here.
-  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; manifest-src 'self'; connect-src 'self' https://testnetscan.com https://*.testnetscan.com https://mempool.space https://litecoinspace.org https://api.coingecko.com https://api.coinbase.com https://xmr-testnet-node.librenode.com https://xmr-stagenet-node.librenode.com https://ltc-testnet-node.librenode.com https://cypherfaucet.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'
+# connect-src lists the default Monero nodes, the Litecoin MWEB (Core REST) node, and the self-hosted testnetscan.com Esplora API/explorer (apex + subdomains) + the mwebscan.com MWEB privacy API; if you self-host any, add its origin here.
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; manifest-src 'self'; connect-src 'self' https://testnetscan.com https://*.testnetscan.com https://*.mwebscan.com https://mempool.space https://litecoinspace.org https://api.coingecko.com https://api.coinbase.com https://xmr-testnet-node.librenode.com https://xmr-stagenet-node.librenode.com https://ltc-testnet-node.librenode.com https://cypherfaucet.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'
   X-Frame-Options: DENY
   Strict-Transport-Security: max-age=31536000; includeSubDomains
   X-Content-Type-Options: nosniff
