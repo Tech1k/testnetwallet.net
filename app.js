@@ -43,8 +43,9 @@ const COINS = {
         explorer:'https://mempool.space/testnet4' },
   ltc:{ name:'Litecoin', ticker:'tLTC', priceSym:'LTC', color:'#345d9d', enabled:true, uri:'litecoin',
         msgPrefix:'Litecoin Signed Message:\n',
-        net: LTC_TESTNET, api:'https://testnetscan.com/ltc/testnet/api',   // self-hosted electrs-ltc Esplora API (see testnetscan.com/docs)
-        explorer:'https://testnetscan.com/ltc/testnet' },
+        net: LTC_TESTNET, api:'https://testnetscan.com/ltc-testnet/api',   // self-hosted electrs-ltc Esplora API; paths are /{coin}-{net}/api (see testnetscan.com/docs)
+        apiFallback:'https://litecoinspace.org/testnet/api',               // auto-fallback when testnetscan errors (5xx/timeout); already in CSP
+        explorer:'https://testnetscan.com/ltc-testnet' },
   xmr:{ name:'Monero', ticker:'XMR', priceSym:'XMR', color:'#ff6600', enabled:false, uri:'monero', addrModel:'monero',
         explorers:{ stagenet:'https://xmr-stagenet.librenode.com', testnet:'https://xmr-testnet.librenode.com' } }, // keys are pure-JS; balance/history/send/sign run through the lazy-loaded node engine. enabled set true at boot iff self-test passes.
 };
@@ -236,7 +237,7 @@ async function unlockVault(vault, password){
 function softLock(){ if(!_pin || !_cryptoKey){ lockWallet(); return; } _softLocked = true; closeModal(); render(); }
 function lockWallet(){   // FULL lock: wipe the in-memory key + decrypted seed + PIN + sensitive state, require the password
   _cryptoKey = null; _locked = true; _pin = null; _softLocked = false;
-  _discoverTok++; state.refreshSeq++;   // abort any in-flight gap-scan / refresh fetches so the locked wallet stops emitting address queries
+  _discoverTok++; _cancelRefresh();   // abort in-flight gap-scan + refresh AND release the refresh machine, so a locked wallet stops querying and unlock refreshes cleanly
   state.master = null; state.wallet = null; state.xmrKeys = null; state.mwebKeys = null; state.mwebSend = null; state.watchOnly = false; state.addresses = [];
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };
   state.mweb = { syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false };   // wipe MWEB keys + scan cache too
@@ -273,18 +274,36 @@ function isValidAddress(addr, coin){
 
 /* ----------------------------- Esplora data layer ----------------------------- */
 // Base URL for a coin's Esplora API: a user-set self-hosted override (Settings) or the built-in default.
-function apiBase(coin){ return (store.settings && store.settings.api && store.settings.api[coin]) || COINS[coin].api; }
+let _apiCooldown = {};                                                    // coin -> ts: after the primary API fails, prefer its fallback until this time
+function apiBases(coin){                                                  // ordered origins to try: [primary, fallback?]; a user override opts out of auto-fallback
+  const override = store.settings && store.settings.api && store.settings.api[coin];
+  if(override) return [override];
+  const c = COINS[coin]; const list = c.apiFallback ? [c.api, c.apiFallback] : [c.api];
+  if(list.length > 1 && _apiCooldown[coin] && Date.now() < _apiCooldown[coin]) return [list[1], list[0]];   // primary recently failed -> try fallback first (still re-probe primary)
+  return list;
+}
+function apiBase(coin){ return apiBases(coin)[0]; }                       // currently-preferred origin (used by broadcast / tip / prevout-hex)
 async function apiGet(coin, path, signal){
-  const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 12000);
-  const onAbort = () => ac.abort('superseded');                          // let a caller (e.g. a superseded scan) cancel this in-flight request
-  if(signal){ if(signal.aborted) ac.abort('superseded'); else signal.addEventListener('abort', onAbort, { once:true }); }
-  try {
-    const r = await fetch(apiBase(coin) + path, { signal: ac.signal });
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    const ct = r.headers.get('content-type') || '';
-    if(!ct.includes('json')) throw new Error('unexpected response');
-    return await r.json();
-  } finally { clearTimeout(t); if(signal) signal.removeEventListener('abort', onAbort); }
+  const bases = apiBases(coin); const c = COINS[coin]; let lastErr;
+  for(let k = 0; k < bases.length; k++){
+    const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 12000);
+    const onAbort = () => ac.abort('superseded');                        // a superseded scan cancels this in-flight request
+    if(signal){ if(signal.aborted) ac.abort('superseded'); else signal.addEventListener('abort', onAbort, { once:true }); }
+    try {
+      const r = await fetch(bases[k] + path, { signal: ac.signal });
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const ct = r.headers.get('content-type') || '';
+      if(!ct.includes('json')) throw new Error('unexpected response');
+      const data = await r.json();
+      if(bases.length > 1 && bases[k] === c.api) delete _apiCooldown[coin];   // primary healthy -> resume normal (primary-first) order
+      return data;
+    } catch(e){
+      lastErr = e;
+      if(!(signal && signal.aborted) && bases.length > 1 && bases[k] === c.api) _apiCooldown[coin] = Date.now() + 60000;   // REAL primary failure (not a deliberate abort) -> prefer fallback ~60s, then it EXPIRES so the primary is re-probed
+      if((signal && signal.aborted) || k === bases.length - 1) throw e;  // aborted on purpose, or out of candidates -> give up
+    } finally { clearTimeout(t); if(signal) signal.removeEventListener('abort', onAbort); }
+  }
+  throw lastErr;
 }
 async function getStats(coin, addr, signal){
   const s = await apiGet(coin, '/address/'+encodeURIComponent(addr), signal);
@@ -313,13 +332,22 @@ async function getUtxos(coin, addr){
   return u;
 }
 async function broadcast(coin, hex){
-  const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 15000);
-  try {
-    const r = await fetch(apiBase(coin) + '/tx', { method:'POST', body: hex, signal: ac.signal });
-    const txt = (await r.text()).trim();
-    if(!r.ok) throw new Error(txt || ('HTTP '+r.status));
-    return txt;
-  } finally { clearTimeout(t); }
+  const bases = apiBases(coin); const c = COINS[coin]; let lastErr;   // same primary->fallback failover as apiGet, for the broadcast write path
+  for(let k = 0; k < bases.length; k++){
+    const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 15000);
+    try {
+      const r = await fetch(bases[k] + '/tx', { method:'POST', body: hex, signal: ac.signal });
+      const txt = (await r.text()).trim();
+      if(!r.ok) throw new Error(txt || ('HTTP '+r.status));
+      if(bases.length > 1 && bases[k] === c.api) delete _apiCooldown[coin];
+      return txt;
+    } catch(e){
+      lastErr = e;
+      if(bases.length > 1 && bases[k] === c.api) _apiCooldown[coin] = Date.now() + 60000;
+      if(k === bases.length - 1) throw e;
+    } finally { clearTimeout(t); }
+  }
+  throw lastErr;
 }
 /* CypherFaucet API (the sibling faucet) - keyless, rate-limited, CORS-friendly. One-click in-wallet claiming. */
 const FAUCET = 'https://cypherfaucet.com';
@@ -809,6 +837,7 @@ async function discoverAddresses(ck){
 
 /* ----------------------------- data refresh (race-guarded) ----------------------------- */
 let _refreshAbort = null, _refreshBusy = false, _refreshPending = false, _refreshCtx = null;
+function _cancelRefresh(){ if(_refreshAbort) _refreshAbort.abort('cancelled'); _refreshAbort = null; _refreshBusy = false; _refreshPending = false; state.refreshSeq++; }   // supersede + release the refresh machine on lock / context switch so it never strands _refreshBusy
 async function refresh(){
   if(!state.wallet) return;
   if(COINS[state.coin].addrModel === 'monero' || isMweb()){ state.loading = false; state.error = null; renderStatus(); return; }   // Monero + MWEB use their own client-side scanners, not Esplora
@@ -1767,7 +1796,7 @@ function mwebEnabled(){ return MWEB_ENABLED && state.mwebOk === true; }
 function isMweb(){ return state.coin === 'ltc' && state.ltcMweb === true && mwebEnabled(); }   // MWEB is an address-type within Litecoin, not a separate coin
 function switchCoin(coin){ if(state.watchOnly) return; if(!COINS[coin].enabled||coin===state.coin) return; state.coin=coin; _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); render(); refresh(); }
 function switchType(type){ if(type===state.addrType && !state.ltcMweb) return; state.ltcMweb=false; state.addrType=type; saveSettings(); buildAddresses(); render(); refresh(); }
-function switchToMweb(){ if(isMweb()) return; state.ltcMweb=true; saveSettings(); buildAddresses(); render(); }   // enter MWEB mode on the Litecoin wallet
+function switchToMweb(){ if(isMweb()) return; _cancelRefresh(); state.ltcMweb=true; saveSettings(); buildAddresses(); render(); }   // enter MWEB mode; cancel any in-flight on-chain scan so it cannot clobber shared state
 function switchXmrNet(net){ if(net===state.xmrNet || !xmr.XMR_NETS[net] || state.xmr.syncing) return; state.xmrNet=net; state.xmrAccount=0;
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };   // each net has its own balance + cache; reset so the new net re-syncs (auto-resumes from its own cache)
   saveSettings(); buildAddresses(); render(); }
@@ -2151,6 +2180,7 @@ function exportMwebViewKey(){
 // mwebscan.com MWEB privacy-analysis API (testnet). PRIVACY: only aggregate/generic endpoints are used, and NO user
 // amount or address is ever sent - the coach fetches the public peg-in amount distribution once and assesses locally.
 const MWEBSCAN_API = 'https://testnet.mwebscan.com/api';
+const mwebBucket = a => (Math.round(Number(a) * 10) / 10).toFixed(1);     // one shared 0.1-tLTC bucket key for both distribution keying and lookup
 // Fetch mwebscan's public aggregate peg data ONCE - generic endpoints only, so no user amount or address is ever sent.
 async function mwebscanData(){
   const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 8000);
@@ -2158,7 +2188,7 @@ async function mwebscanData(){
     const j = u => fetch(MWEBSCAN_API + u, { signal: ac.signal }).then(r => r.ok ? r.json() : null).catch(()=>null);
     const [rec, dist] = await Promise.all([ j('/recommendations'), j('/pegin_amounts?limit=500') ]);
     const R = (rec && rec.recommendations) || {};
-    const toMap = (rows, key) => { const m = new Map(); for(const x of rows || []) m.set(Number(x.amount).toFixed(1), Number(x[key])||0); return m; };
+    const toMap = (rows, key) => { const m = new Map(); for(const x of rows || []) m.set(mwebBucket(x.amount), Number(x[key])||0); return m; };
     const pegin  = { best: R.best_pegin_amounts  || [], dist: toMap((dist && dist.pegin_amounts) || [], 'count') };      // full peg-in distribution
     const pegout = { best: R.best_pegout_amounts || [], dist: toMap(R.best_pegout_amounts || [], 'anonymity_set') };     // no /pegout_amounts endpoint -> the recommended set is the lookup
     return (pegin.best.length || pegin.dist.size || pegout.best.length) ? { pegin, pegout } : false;   // no data -> unavailable (coaches hide)
@@ -2167,7 +2197,7 @@ async function mwebscanData(){
 // Reproduce mwebscan's 0.1-tLTC bucketing locally so the typed amount never leaves the browser. label = 'peg-in' | 'peg-out'.
 function mwebscanAssess(amountLtc, data, label){
   if(!(amountLtc > 0) || !data) return null;
-  const rounded = (Math.round(amountLtc * 10) / 10).toFixed(1);
+  const rounded = mwebBucket(amountLtc);
   const set = data.dist.get(rounded) || 0;
   if(set >= 10) return { rounded, set, level:'ok',   note:'blends with ' + set + ' other ' + label + 's' };
   if(set >= 2)  return { rounded, set, level:'warn', note:'only ' + set + ' others used ~' + rounded + ' tLTC (more linkable)' };
@@ -2321,16 +2351,16 @@ function renderMwebSend(){
     const pegouts = []; s.recipients.forEach((r,i)=>{ if(isValidAddress((r.to||'').trim(),'ltc')) pegouts.push({ r, i }); });
     if(!pegouts.length) return;                   // no transparent recipients -> a pure MWEB->MWEB send is already private
     const box = el('div',{class:'field',style:'gap:4px'}, el('label',{class:'fld'},'MWEB peg-out privacy'));
-    const chips = el('div',{class:'row',style:'flex-wrap:wrap;gap:6px;flex:0;align-items:center'}, el('span',{class:'faint'},'Blend in: '));
-    for(const rec of _pegoutData.best.slice(0,6)){
-      const b = el('button',{class:'btn ghost sm',type:'button',title:rec.anonymity_set + ' peg-outs used this amount'}, String(rec.amount));
-      b.addEventListener('click', ()=>{ pegouts[0].r.amount = String(rec.amount); clearHex(); renderRows(); updateFeeNote(); });
-      chips.append(b);
-    }
-    box.append(chips);
-    for(const { r, i } of pegouts){
+    for(const { r, i } of pegouts){                                       // per-row: chips + assessment target THIS recipient (fixes the multi-recipient overwrite)
+      const chips = el('div',{class:'row',style:'flex-wrap:wrap;gap:6px;flex:0;align-items:center'}, el('span',{class:'faint'}, (pegouts.length>1 ? ('Recipient ' + (i+1) + ' blend in: ') : 'Blend in: ')));
+      for(const rec of _pegoutData.best.slice(0,6)){
+        const b = el('button',{class:'btn ghost sm',type:'button',title:rec.anonymity_set + ' peg-outs used this amount'}, String(rec.amount));
+        b.addEventListener('click', ()=>{ r.amount = String(rec.amount); clearHex(); renderRows(); updateFeeNote(); });
+        chips.append(b);
+      }
+      box.append(chips);
       const a = mwebscanAssess(parseFloat(r.amount)||0, _pegoutData, 'peg-out');
-      if(a) box.append(el('div',{class:'msg ' + a.level,style:'margin-top:2px'}, (s.recipients.length>1 ? ('Recipient ' + (i+1) + ' ') : '') + '~' + a.rounded + ' tLTC: ' + a.note));
+      if(a) box.append(el('div',{class:'msg ' + a.level,style:'margin-top:2px'}, '~' + a.rounded + ' tLTC: ' + a.note));
     }
     box.append(el('div',{class:'sub faint'},'Privacy data via ', el('a',{href:'https://testnet.mwebscan.com',target:'_blank',rel:'noopener'},'mwebscan ↗')));
     pegoutCoach.append(box);
