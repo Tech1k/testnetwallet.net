@@ -121,6 +121,8 @@
     border-radius:var(--r-sm); padding:.6em .7em; font-size:14px; font-family:inherit}
   textarea{resize:vertical; min-height:78px; font-family:var(--mono)}
   input:focus,textarea:focus,select:focus{outline:2px solid var(--accent-dim); border-color:var(--accent)}
+  input[type=number]{-moz-appearance:textfield; appearance:textfield}   /* hide the default number spinner (clunky on dark theme) */
+  input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none; margin:0}
   /* keyboard focus ring for clickable non-form controls */
   .btn:focus-visible,.pill:focus-visible,.tab:focus-visible,.copy:focus-visible,.theme-toggle:focus-visible,
   .tx-item:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:var(--r-sm)}

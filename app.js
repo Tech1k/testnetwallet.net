@@ -567,7 +567,7 @@ function actWatchViewKey(){
   const goBtn = el('button',{class:'btn'},'Watch');
   goBtn.addEventListener('click', ()=>{ clear(msg); try { addViewWallet(nameIn.value.trim(), vkIn.value.trim()); } catch(e){ msg.append(el('div',{class:'msg bad'}, e.message||String(e))); } });
   const cancelBtn = el('button',{class:'btn ghost'},'Cancel'); cancelBtn.addEventListener('click', closeModal);
-  showModal(el('div',{class:'card',style:'max-width:520px'},
+  showModal(el('div',{},
     el('div',{class:'card-h'},'Watch a view key'),
     el('div',{class:'card-b stack'},
       el('div',{class:'sub faint'},'Import an MWEB view key (from another wallet’s Receive screen, Export view key) to watch a balance read-only. You see the balance, history, and receive addresses, but cannot spend. Litecoin MWEB only.'),
@@ -2169,7 +2169,7 @@ function exportMwebViewKey(){
   const ta = el('textarea',{readonly:'',rows:'3',style:'width:100%;font-family:ui-monospace,monospace;font-size:12px;word-break:break-all'}); ta.value = vk;
   const copyBtn = el('button',{class:'btn'},'Copy view key'); copyBtn.addEventListener('click',()=>copyText(vk,copyBtn,true));
   const closeBtn = el('button',{class:'btn ghost'},'Close'); closeBtn.addEventListener('click',closeModal);
-  showModal(el('div',{class:'card',style:'max-width:520px'},
+  showModal(el('div',{},
     el('div',{class:'card-h'},'MWEB view key'),
     el('div',{class:'card-b stack'},
       el('div',{class:'msg warn'},'Anyone with this key can see the full MWEB balance and history of this wallet (every amount received or sent), but CANNOT spend. Share it only with someone you want to audit this wallet.'),
@@ -2208,7 +2208,7 @@ function actShieldToMweb(){
   const amtIn = el('input',{type:'text',inputmode:'decimal',placeholder:'amount in LTC',style:'max-width:200px'});
   const feeIn = el('input',{type:'number',min:'1',value:'2',style:'max-width:120px'});
   const msg = el('div',{});
-  const goBtn = el('button',{class:'btn'},'Shield');
+  const goBtn = el('button',{class:'btn'},'Peg in');
   const coach = el('div',{class:'sub',style:'min-height:1.2em'});
   let _coach = null;                                            // null = loading, false = unavailable, object = data
   const renderCoach = ()=>{
@@ -2239,14 +2239,14 @@ function actShieldToMweb(){
       const dry = await mwebNode.testAccept(broadcastUrl, r.hex);
       if(!(dry && dry.allowed)){ clear(msg).append(el('div',{class:'msg bad'},'Node rejected: ' + ((dry && dry['reject-reason'])||'unknown'))); goBtn.disabled=false; return; }
       const txid = await mwebNode.broadcast(broadcastUrl, r.hex);
-      clear(msg).append(el('div',{class:'msg ok'},'Shielded ' + fmtMwebLtc(r.amount) + ' LTC. txid ', el('span',{class:'mono'}, txid)));
+      clear(msg).append(el('div',{class:'msg ok'},'Pegged in ' + fmtMwebLtc(r.amount) + ' LTC. txid ', el('span',{class:'mono'}, txid)));
       setTimeout(()=>{ const m2=state.mweb; if(m2){ m2.synced=false; m2._autoTried=false; } if(isMweb()) mwebSync(); }, 4000);
     } catch(e){ clear(msg).append(el('div',{class:'msg bad'}, e.message||String(e))); }
     finally { goBtn.disabled=false; }
   });
   const cancelBtn = el('button',{class:'btn ghost'},'Cancel'); cancelBtn.addEventListener('click', closeModal);
-  showModal(el('div',{class:'card',style:'max-width:520px'},
-    el('div',{class:'card-h'},'Shield Litecoin into MWEB'),
+  showModal(el('div',{},
+    el('div',{class:'card-h'},'Peg Litecoin into MWEB'),
     el('div',{class:'card-b stack'},
       el('div',{class:'sub faint'},'Move transparent Litecoin testnet coins into your private MWEB balance (a peg-in to your own MWEB address). Costs a Litecoin network fee plus a fixed 2100-litoshi MWEB fee. This is new, so verify on testnet.'),
       el('div',{class:'field'}, el('label',{class:'fld'},'Amount (LTC)'), amtIn),
@@ -2277,7 +2277,7 @@ function renderMwebReceive(){
       el('div',{class:'row',style:'flex:0;margin:6px 0 4px'}, copyAddr,
         el('button',{class:'btn ghost sm',onclick:deriveNext},'Derive next address'),
         state.watchOnly ? null : el('button',{class:'btn ghost sm',onclick:exportMwebViewKey,title:'Share a read-only view key (audit balance + history, no spend)'},'Export view key'),
-        state.watchOnly ? null : el('button',{class:'btn ghost sm',onclick:actShieldToMweb,title:'Move transparent Litecoin into your MWEB balance (peg-in)'},'Shield from Litecoin')),
+        state.watchOnly ? null : el('button',{class:'btn ghost sm',onclick:actShieldToMweb,title:'Move transparent Litecoin into your MWEB balance (peg-in)'},'Peg in from Litecoin')),
       el('div',{class:'sub faint'},'A tmweb stealth address (bech32). Send Litecoin testnet coins here over MWEB; your balance and history appear after you scan on the balance screen. Same recovery phrase as your Litecoin wallet, so MWEB funds restore in any MWEB-capable Litecoin wallet.'),
       el('hr',{class:'hr'}),
       el('div',{class:'sub'},'Your MWEB addresses'), list,
