@@ -664,6 +664,7 @@ function snapshotData(){
     counts: store.counts || {},
     txNotes: store.txNotes || {},
     xmrLabels: store.xmrLabels || {},                                                  // Monero subaddress labels (per wallet)
+    mwebLabels: store.mwebLabels || {},                                                // MWEB output labels (per wallet)
     xmrRestore: (store.settings && store.settings.xmrRestore) || {},                    // per-wallet Monero restore heights
     mwebRestore: (store.settings && store.settings.mwebRestore) || {},                  // per-wallet MWEB restore heights
     contacts: store.contacts || [],
@@ -747,6 +748,8 @@ function importBackup(data){
     for(const k of Object.keys(data.txNotes)) store.txNotes[k] = Object.assign({}, data.txNotes[k], store.txNotes[k]); }
   if(data.xmrLabels && typeof data.xmrLabels === 'object'){ store.xmrLabels = store.xmrLabels || {};   // Monero subaddress labels (per wallet)
     for(const k of Object.keys(data.xmrLabels)) store.xmrLabels[k] = Object.assign({}, data.xmrLabels[k], store.xmrLabels[k]); }
+  if(data.mwebLabels && typeof data.mwebLabels === 'object'){ store.mwebLabels = store.mwebLabels || {};   // MWEB output labels (per wallet)
+    for(const k of Object.keys(data.mwebLabels)) store.mwebLabels[k] = Object.assign({}, data.mwebLabels[k], store.mwebLabels[k]); }
   if(data.xmrRestore && typeof data.xmrRestore === 'object'){ store.settings = store.settings || {}; store.settings.xmrRestore = store.settings.xmrRestore || {};   // per-wallet Monero restore heights
     for(const k of Object.keys(data.xmrRestore)) store.settings.xmrRestore[k] = Object.assign({}, data.xmrRestore[k], store.settings.xmrRestore[k]); }
   if(data.mwebRestore && typeof data.mwebRestore === 'object'){ store.settings = store.settings || {}; store.settings.mwebRestore = store.settings.mwebRestore || {};   // per-wallet MWEB restore heights
@@ -1289,6 +1292,14 @@ function setXmrLabel(idx, label){
   const n = w[state.xmrNet] = w[state.xmrNet] || {};
   const k = xmrLabelKey(idx);
   if(label && label.trim()) n[k] = label.trim(); else delete n[k];
+  saveStore();
+}
+// local per-wallet MWEB output labels (client-side, keyed by output_id)
+function getMwebLabel(id){ const o = store.mwebLabels && store.mwebLabels[state.wallet.id]; return (o && o[id]) || ''; }
+function setMwebLabel(id, label){
+  store.mwebLabels = store.mwebLabels || {};
+  const w = store.mwebLabels[state.wallet.id] = store.mwebLabels[state.wallet.id] || {};
+  if(label && label.trim()) w[id] = label.trim(); else delete w[id];
   saveStore();
 }
 function renderMoneroReceive(){
@@ -2191,7 +2202,8 @@ async function mwebscanData(){
     const toMap = (rows, key) => { const m = new Map(); for(const x of rows || []) m.set(mwebBucket(x.amount), Number(x[key])||0); return m; };
     const pegin  = { best: R.best_pegin_amounts  || [], dist: toMap((dist && dist.pegin_amounts) || [], 'count') };      // full peg-in distribution
     const pegout = { best: R.best_pegout_amounts || [], dist: toMap(R.best_pegout_amounts || [], 'anonymity_set') };     // no /pegout_amounts endpoint -> the recommended set is the lookup
-    return (pegin.best.length || pegin.dist.size || pegout.best.length) ? { pegin, pegout } : false;   // no data -> unavailable (coaches hide)
+    const wait = { blocks: Number(R.recommended_wait_blocks)||0, hours: Number(R.recommended_wait_hours)||0, mixes: Number(R.recommended_internal_mixes)||0 };   // peg-in -> peg-out timing/mix guidance
+    return (pegin.best.length || pegin.dist.size || pegout.best.length) ? { pegin, pegout, wait } : false;   // no data -> unavailable (coaches hide)
   } finally { clearTimeout(t); }
 }
 // Reproduce mwebscan's 0.1-tLTC bucketing locally so the typed amount never leaves the browser. label = 'peg-in' | 'peg-out'.
@@ -2239,6 +2251,7 @@ function actShieldToMweb(){
       const dry = await mwebNode.testAccept(broadcastUrl, r.hex);
       if(!(dry && dry.allowed)){ clear(msg).append(el('div',{class:'msg bad'},'Node rejected: ' + ((dry && dry['reject-reason'])||'unknown'))); goBtn.disabled=false; return; }
       const txid = await mwebNode.broadcast(broadcastUrl, r.hex);
+      store.lastPegin = store.lastPegin || {}; store.lastPegin[state.wallet.id] = Date.now(); saveStore();   // remember peg-in time for the peg-out timing coach
       clear(msg).append(el('div',{class:'msg ok'},'Pegged in ' + fmtMwebLtc(r.amount) + ' LTC. txid ', el('span',{class:'mono'}, txid)));
       setTimeout(()=>{ const m2=state.mweb; if(m2){ m2.synced=false; m2._autoTried=false; } if(isMweb()) mwebSync(); }, 4000);
     } catch(e){ clear(msg).append(el('div',{class:'msg bad'}, e.message||String(e))); }
@@ -2291,17 +2304,20 @@ function renderMwebHistory(){
   const tb = el('tbody',{});
   for(const t of txs){
     const cp = el('span',{class:'copy'},'copy'); cp.addEventListener('click', ()=>copyText(t.output_id, cp));
+    const lbl = el('input',{type:'text',value:getMwebLabel(t.output_id),placeholder:'label',style:'max-width:120px;font-size:12px;padding:.3em .5em'});
+    lbl.addEventListener('change', ()=>setMwebLabel(t.output_id, lbl.value));
     tb.append(el('tr',{},
       el('td',{}, el('span',{class: t.spent ? '' : 'ok'}, t.spent ? '↑ spent' : '↓ received')),
       el('td',{class:'mono'}, fmtMwebLtc(t.value) + ' LTC'),
       el('td',{class:'mono faint'}, t.height ? t.height.toLocaleString() : '-'),
-      el('td',{}, el('div',{class:'addr',style:'max-width:200px'}, t.output_id), cp)));
+      el('td',{}, lbl),
+      el('td',{}, el('div',{class:'addr',style:'max-width:180px'}, t.output_id), cp)));
   }
   return el('div',{class:'card'},
     el('div',{class:'card-h'},'MWEB activity', el('span',{class:'sub'}, 'received outputs · testnet')),
     el('div',{class:'card-b'},
       el('div',{class:'sub faint',style:'margin-bottom:8px'},'MWEB is private: amounts and outputs are visible only to you, so there is no public per-transaction explorer link.'),
-      el('table',{}, el('thead',{}, el('tr',{}, el('th',{},''), el('th',{},'Amount'), el('th',{},'Block'), el('th',{},'Output ID'))), tb)));
+      el('table',{}, el('thead',{}, el('tr',{}, el('th',{},''), el('th',{},'Amount'), el('th',{},'Block'), el('th',{},'Label'), el('th',{},'Output ID'))), tb)));
 }
 
 function renderMwebSend(){
@@ -2335,6 +2351,31 @@ function renderMwebSend(){
     if(isValidAddress(toStr,'ltc')){ const script=btc.OutScript.encode(btc.Address(COINS.ltc.net).decode(toStr)); return { kind:'pegout', value:amt, pegW:Math.ceil(script.length/42), recipient:{ script, value:amt } }; }
     throw new Error('Enter a valid tmweb or Litecoin testnet address for each recipient.');
   }
+  function mwebMaxFill(i){                                             // send-all: recipient i absorbs the balance minus the (deterministic) no-change fee and the other recipients
+    let mwebOuts=0, pegW=0, others=0n;
+    s.recipients.forEach((r,idx)=>{
+      if(idx===i){                                                     // the max row is always an output; size it by its address (default MWEB), matching build()
+        const toStr=(r.to||'').trim();
+        if(toStr && isValidAddress(toStr,'ltc')) pegW += Math.ceil(btc.OutScript.encode(btc.Address(COINS.ltc.net).decode(toStr)).length/42); else mwebOuts++;
+        return;
+      }
+      let p=null; try{ p=parseRow(r); }catch(_){}                      // OTHER rows: only PARSEABLE ones count as outputs, exactly as build() does (empty rows are dropped)
+      if(!p) return;
+      if(p.kind==='pegout') pegW += p.pegW; else mwebOuts++;
+      others += p.value;
+    });
+    const fee = mwebTxFee(mwebOuts, pegW).fee;                         // no change output on a max send
+    const max = total - fee - others;
+    if(max <= 0n){ toast('Balance too low to send','warn'); return; }
+    s.recipients[i].amount = fmtMwebLtc(max); clearHex(); renderRows(); updateFeeNote();
+  }
+  function mwebSelfMix(){                                              // consolidate the whole MWEB balance into one fresh self-output (breaks linkability before a peg-out)
+    const fee = mwebTxFee(1, 0).fee;
+    if(total <= fee){ toast('MWEB balance too low to mix','warn'); return; }
+    s.recipients = [{ to: state.addresses[state.addresses.length-1].address, amount: fmtMwebLtc(total - fee) }];
+    clearHex(); renderRows(); updateFeeNote();
+    toast('Self-mix prepared: your MWEB balance into one fresh output of your own. Check + Send.','ok');
+  }
   const feeNote = el('div',{class:'sub'});
   function updateFeeNote(){   // assume a change output (the common case)
     let mwebOuts=0, pegW=0;
@@ -2344,7 +2385,7 @@ function renderMwebSend(){
     updatePegoutCoach();
   }
   const pegoutCoach = el('div',{});
-  let _pegoutData = null;                        // null = loading, false = unavailable, object = mwebscan peg-out data
+  let _pegoutData = null, _waitData = null;      // null = loading, false = unavailable; mwebscan peg-out amounts + timing data
   function updatePegoutCoach(){                   // peg-out privacy coach - shown only for transparent (peg-out) recipients
     clear(pegoutCoach);
     if(!_pegoutData) return;                      // loading / unavailable -> nothing shown
@@ -2362,22 +2403,29 @@ function renderMwebSend(){
       const a = mwebscanAssess(parseFloat(r.amount)||0, _pegoutData, 'peg-out');
       if(a) box.append(el('div',{class:'msg ' + a.level,style:'margin-top:2px'}, '~' + a.rounded + ' tLTC: ' + a.note));
     }
+    if(_waitData && (_waitData.blocks || _waitData.hours)){          // timing is the OTHER half of the leak: peg-in -> peg-out correlation
+      const last = store.lastPegin && store.lastPegin[state.wallet.id];
+      const elapsed = last ? (()=>{ const h=(Date.now()-last)/3600000; return ' You pegged in ~' + (h<1 ? Math.round(h*60)+' min' : h.toFixed(1)+' h') + ' ago.'; })() : '';
+      box.append(el('div',{class:'sub',style:'margin-top:6px'}, 'Timing: wait ~' + _waitData.blocks + ' blocks (~' + _waitData.hours + ' h) after a peg-in before pegging out, so the two are not linkable by timing.' + elapsed));
+    }
     box.append(el('div',{class:'sub faint'},'Privacy data via ', el('a',{href:'https://testnet.mwebscan.com',target:'_blank',rel:'noopener'},'mwebscan ↗')));
     pegoutCoach.append(box);
   }
-  mwebscanData().then(d=>{ _pegoutData = d && d.pegout; updatePegoutCoach(); }).catch(()=>{ _pegoutData = false; updatePegoutCoach(); });
+  mwebscanData().then(d=>{ _pegoutData = d && d.pegout; _waitData = d && d.wait; updatePegoutCoach(); }).catch(()=>{ _pegoutData = false; updatePegoutCoach(); });
   const rowsWrap = el('div',{class:'stack'});
   function renderRows(){
     clear(rowsWrap);
     s.recipients.forEach((r,i)=>{
       const toIn=el('input',{type:'text',placeholder:'tmweb1… or a Litecoin testnet address',value:r.to}); toIn.addEventListener('input',e=>{ r.to=e.target.value; clearHex(); updateFeeNote(); });
       const scanB=el('button',{class:'btn ghost sm',title:'Scan a QR code',onclick:()=>scanModal(text=>{ const p=parseBip21(text); r.to=(p&&p.address)?p.address:String(text).trim(); s._hex=null; render(); })},'Scan');
+      const pick = (store.contacts && store.contacts.length) ? el('button',{class:'btn ghost sm',title:'Pick from contacts',onclick:()=>actContacts(a=>{ r.to=a; closeModal(); render(); })},'Pick') : null;
       const amtIn=el('input',{type:'text',inputmode:'decimal',placeholder:'amount in LTC',value:r.amount,style:'max-width:170px'}); amtIn.addEventListener('input',e=>{ r.amount=e.target.value; clearHex(); updateFeeNote(); });
+      const maxB=el('button',{class:'btn ghost sm',title:'Send maximum',onclick:()=>mwebMaxFill(i)},'Max');
       const rm = s.recipients.length>1 ? el('button',{class:'btn ghost sm',title:'Remove recipient',onclick:()=>{ s.recipients.splice(i,1); clearHex(); renderRows(); updateFeeNote(); }},'✕') : null;
       rowsWrap.append(el('div',{class:'field'},
         el('label',{class:'fld'}, (s.recipients.length>1?('Recipient '+(i+1)):'To')+' (tmweb, or a Litecoin address to peg-out)'),
-        el('div',{class:'row',style:'align-items:center'}, toIn, scanB),
-        el('div',{class:'row',style:'align-items:center;margin-top:4px'}, amtIn, el('span',{class:'sub faint'},'LTC'), rm)));
+        el('div',{class:'row',style:'align-items:center'}, toIn, scanB, pick),
+        el('div',{class:'row',style:'align-items:center;margin-top:4px'}, amtIn, el('span',{class:'sub faint'},'LTC'), maxB, rm)));
     });
   }
   renderRows();
@@ -2434,7 +2482,8 @@ function renderMwebSend(){
     el('div',{class:'card-h'}, 'Send MWEB', el('span',{class:'sub'}, fmtMwebLtc(total) + ' LTC spendable · testnet')),
     el('div',{class:'card-b stack'},
       rowsWrap,
-      el('div',{style:'margin:-2px 0 2px'}, addBtn),
+      el('div',{class:'row',style:'flex:0;gap:8px;margin:-2px 0 2px'}, addBtn,
+        el('button',{class:'btn ghost sm',title:'Consolidate your whole MWEB balance into one fresh self-output to improve privacy before a peg-out',onclick:mwebSelfMix},'Self-mix')),
       pegoutCoach,
       el('div',{class:'field'}, el('label',{class:'fld'},'Network fee'), feeNote),
       el('div',{class:'sub faint'},'Send to tmweb addresses to stay private, or to regular Litecoin testnet addresses to peg-out (the node settles those to transparent outputs). A 64-bit range proof is built in your browser per MWEB output (a small prover loads once), then broadcast through your node. Always Check (dry-run) first. Sending is new, so verify on testnet.'),
@@ -2722,6 +2771,8 @@ function actWallets(editId){
         if(store.counts) delete store.counts[w.id];
         if(store.txNotes) delete store.txNotes[w.id];
         if(store.xmrLabels) delete store.xmrLabels[w.id];
+        if(store.mwebLabels) delete store.mwebLabels[w.id];
+        if(store.lastPegin) delete store.lastPegin[w.id];
         if(store.settings && store.settings.xmrRestore) delete store.settings.xmrRestore[w.id];
         if(store.settings && store.settings.mwebRestore) delete store.settings.mwebRestore[w.id];
         deleteXmrData(w.id);                                   // purge the wallet's Monero keys+cache too
