@@ -1794,8 +1794,8 @@ function txActions(t, c){
 /* ----------------------------- coin / type switching ----------------------------- */
 function mwebEnabled(){ return MWEB_ENABLED && state.mwebOk === true; }
 function isMweb(){ return state.coin === 'ltc' && state.ltcMweb === true && mwebEnabled(); }   // MWEB is an address-type within Litecoin, not a separate coin
-function switchCoin(coin){ if(state.watchOnly) return; if(!COINS[coin].enabled||coin===state.coin) return; state.coin=coin; _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); render(); refresh(); }
-function switchType(type){ if(type===state.addrType && !state.ltcMweb) return; state.ltcMweb=false; state.addrType=type; saveSettings(); buildAddresses(); render(); refresh(); }
+function switchCoin(coin){ if(state.watchOnly) return; if(!COINS[coin].enabled||coin===state.coin) return; state.coin=coin; clearMax(); _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); render(); refresh(); }
+function switchType(type){ if(type===state.addrType && !state.ltcMweb) return; state.ltcMweb=false; state.addrType=type; clearMax(); saveSettings(); buildAddresses(); render(); refresh(); }
 function switchToMweb(){ if(isMweb()) return; _cancelRefresh(); state.ltcMweb=true; saveSettings(); buildAddresses(); render(); }   // enter MWEB mode; cancel any in-flight on-chain scan so it cannot clobber shared state
 function switchXmrNet(net){ if(net===state.xmrNet || !xmr.XMR_NETS[net] || state.xmr.syncing) return; state.xmrNet=net; state.xmrAccount=0;
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };   // each net has its own balance + cache; reset so the new net re-syncs (auto-resumes from its own cache)
@@ -2931,7 +2931,7 @@ async function buildSelection(){
     changeAddress: state.addresses[0].address, feePerByte: BigInt(feeRate), dust: BigInt(DUST),
     network: net, createTx: true, allowUnknownOutputs: !!opScript,
   });
-  if(!sel || !sel.tx) throw new Error('Not enough coins to cover amount + fee');
+  if(!sel || !sel.tx) throw new Error('Not enough coins to cover amount + fee. Lower the amount, or press Max to send the maximum.');
   return { tx: sel.tx, cand, fee: Number(sel.fee), totalOut: Number(totalOut), feeRate, net };
 }
 // Build + sign (does NOT broadcast). Returns {tx, fee, change, totalOut}.
@@ -3062,6 +3062,27 @@ async function loadCoinControl(btnEl){
   finally { btnEl.disabled=false; btnEl.textContent=lbl; render(); }
 }
 function inputVbytes(type){ return type==='pkh'?148 : type==='sh-wpkh'?91 : type==='tr'?58 : 68; }
+// output vbytes for an address's scriptPubKey (8 value + 1 len-varint + script); precise per type (p2tr=43, p2wpkh=31...), 34 fallback
+function outVbytes(addr){ try { return 8 + 1 + btc.OutScript.encode(btc.Address(COINS[state.coin].net).decode(addr)).length; } catch(_){ return 34; } }
+// re-fill the "max" recipient at the CURRENT fee + current OTHER recipients: it absorbs the remainder (no change output). Silent.
+function syncMax(r){
+  if(!r || !r.max || r._maxTotal == null) return;
+  const s = state.send, rate = Math.max(1, Math.round(parseFloat(s.feeRate)||1));
+  let outVb = 0, others = 0;
+  for(const rr of s.recipients){                                       // fee covers every output (a max send has no change); the max recipient gets what's left
+    const a = rr.address.trim(), isMaxR = rr === r;
+    if(!isMaxR && !a && !(rr.amount||'').trim()) continue;             // skip empty rows, matching buildSelection
+    outVb += (a && isValidAddress(a, state.coin)) ? outVbytes(a) : 34;
+    if(!isMaxR) others += Math.round((parseFloat(rr.amount) || 0) * 1e8);
+  }
+  let opScr = null; try { opScr = opReturnScript(s); } catch(_){}     // an invalid OP_RETURN must not abort render()
+  if(opScr) outVb += 8 + 1 + opScr.length;
+  const fee = Math.ceil((r._maxInputs * inputVbytes(state.addrType) + outVb + 12 + (r._maxInputs >= 253 ? 2 : 0)) * rate);   // +1 vB slack + big-input-count varint so the estimate never under-counts (slack absorbs into the fee, no change output)
+  const max = r._maxTotal - others - fee;
+  if(max <= DUST){ r.max = false; return; }                            // nothing left to max at this fee + these recipients
+  r.amount = fmt(max);
+  if(state.price) r.fiatAmount = (max/1e8*state.price).toFixed(2);
+}
 async function maxFill(i){
   const s = state.send;
   try {
@@ -3070,22 +3091,25 @@ async function maxFill(i){
     if(s.advanced && chosen.length) cand = cand.filter(c=>s.selected[c.outpoint]);
     else { const confirmed = cand.filter(c=>c.confirmed); if(confirmed.length) cand = confirmed; else if(cand.length){ toast('Only unconfirmed coins available. Turn on Coin control to spend them.','warn'); return; } }   // match buildSelection
     if(!cand.length){ toast('No spendable coins','warn'); return; }
-    const total = cand.reduce((a,c)=>a+c.value,0);
-    const rate = Math.max(1, Math.round(parseFloat(s.feeRate)||1));
-    const fee = Math.ceil((cand.length*inputVbytes(state.addrType) + 34 + 11) * rate);  // ~1-output estimate
-    const max = total - fee;
-    if(max <= DUST){ toast('Balance too low to send','warn'); return; }
-    s.recipients[i].amount = fmt(max);
-    if(state.price) s.recipients[i].fiatAmount = (max/1e8*state.price).toFixed(2);
+    const r = s.recipients[i];
+    s.recipients.forEach(rr => rr.max = false);                        // only one recipient is "max" at a time
+    r._maxTotal = cand.reduce((a,c)=>a+c.value,0); r._maxInputs = cand.length; r.max = true;   // cache inputs so the amount re-syncs live as fee/other recipients change
+    syncMax(r);
+    if(!r.max) toast('Not enough to cover the other recipients + fee','warn');   // syncMax dropped max mode
     render();
   } catch(e){ toast('Max failed: '+(e.message||e),'bad'); }
 }
+function clearMax(){ const s = state.send; if(s && s.recipients) s.recipients.forEach(rr=>{ rr.max=false; rr._maxTotal=null; }); }   // input set changed (coin/type/selection) -> any cached max amount is stale
 function renderSend(){
   const c = COINS[state.coin], s = state.send;
   s.denom = s.denom || 'coin';
   const inFiat = s.denom==='fiat' && state.price!=null;
-  const recipWrap = el('div',{class:'stack'});
+  const recipWrap = el('div',{class:'stack'}), amtEls = [];
+  const resyncMax = ()=>{ let dropped=false;                          // re-fill every max recipient at the current fee + other recipients; if one is now exhausted, re-render to clear it + un-highlight
+    s.recipients.forEach((rr,idx)=>{ if(rr.max){ syncMax(rr); if(!rr.max) dropped=true; else if(amtEls[idx]) amtEls[idx].value = inFiat ? (rr.fiatAmount||'') : (rr.amount||''); } });
+    if(dropped) render(); };
   s.recipients.forEach((r,i)=>{
+    if(r.max) syncMax(r);                                              // keep a max-mode recipient synced to the current fee on every render
     const vbadge = el('span',{class:'sub'});
     const setBadge = v=>{ clear(vbadge); const a=(v||'').trim(); if(!a) return;
       if(isValidAddress(a, state.coin)){ const own = state.addresses.some(x=>x.address===a);
@@ -3094,15 +3118,17 @@ function renderSend(){
     const addr = el('input',{type:'text',value:r.address,placeholder:c.name+' address or '+c.uri+': URI',oninput:e=>{
       const v=e.target.value;
       if(/^[a-zA-Z][a-zA-Z0-9.+-]*:/.test(v)){ const p=parseBip21(v); s.recipients[i].address=p.address; if(p.amount){ s.recipients[i].amount=p.amount; s.recipients[i].fiatAmount = state.price ? (parseFloat(p.amount)*state.price).toFixed(2) : ''; } render(); return; }
-      s.recipients[i].address=v; setBadge(v);
+      s.recipients[i].address=v; setBadge(v); resyncMax();            // an address change resizes an output -> re-sync a max recipient's amount
     }});
     setBadge(r.address);
     const amt = el('input',{type:'number',min:'0',step:inFiat?'0.01':'0.00000001',value:inFiat?(r.fiatAmount||''):(r.amount||''),placeholder:inFiat?('amount in '+state.fiat):'amount',style:'max-width:150px',oninput:e=>{
-      const v=e.target.value;
+      const v=e.target.value; r.max=false;                            // typing an amount exits max mode for THIS row
       if(inFiat){ r.fiatAmount=v; r.amount = v ? (parseFloat(v)/state.price).toFixed(8) : ''; }
       else { r.amount=v; r.fiatAmount = (v && state.price) ? (parseFloat(v)*state.price).toFixed(2) : ''; }
+      resyncMax();                                                    // a max recipient absorbs the remainder -> re-sync it after this edit
     }});
-    const maxBtn = el('button',{class:'btn ghost sm',title:'Send maximum',onclick:()=>maxFill(i)},'Max');
+    amtEls[i] = amt;
+    const maxBtn = el('button',{class:'btn ghost sm',style:r.max?'border-color:var(--accent);color:var(--accent)':'',title:'Send the maximum; stays in sync as you change the fee',onclick:()=>{ if(r.max){ r.max=false; render(); } else maxFill(i); }},'Max');
     const pick = (store.contacts && store.contacts.length)   // only offer "Pick" once there are contacts to pick from
       ? el('button',{class:'btn ghost sm',title:'Pick from contacts',onclick:()=>actContacts(a=>{ s.recipients[i].address=a; closeModal(); render(); })},'Pick')
       : null;
@@ -3122,7 +3148,7 @@ function renderSend(){
     if(!dis && s.denom!==k) p.addEventListener('click', ()=>{ s.denom=k; render(); });
     denomPills.append(p);
   }
-  const feeInput = el('input',{type:'number',min:'1',step:'1',value:s.feeRate||'',placeholder:'sat/vB',style:'max-width:120px',title:'Fee rate in satoshis per virtual byte. Higher confirms faster. Minimum is 1 sat/vB; suggestions come from recent blocks.',oninput:e=>{ s.feeRate=e.target.value; }});
+  const feeInput = el('input',{type:'number',min:'1',step:'1',value:s.feeRate||'',placeholder:'sat/vB',style:'max-width:120px',title:'Fee rate in satoshis per virtual byte. Higher confirms faster. Minimum is 1 sat/vB; suggestions come from recent blocks.',oninput:e=>{ s.feeRate=e.target.value; resyncMax(); }});
   const suggestBtn = el('button',{class:'btn ghost sm'},'Suggest');
   suggestBtn.addEventListener('click', async ()=>{ suggestBtn.disabled=true; s.feeRate=String(await getFeeRate(state.coin)); suggestBtn.disabled=false; render(); });
   const FEE_ETA = { slow:'≈ 1 hour', medium:'≈ 30 min', fast:'≈ next blocks' };
@@ -3142,7 +3168,7 @@ function renderSend(){
     el('div',{class:'sub faint'},'Slow ≈ 1 hr · Medium ≈ 30 min · Fast ≈ next blocks. Higher sat/vB confirms sooner.'));
 
   const advToggle = el('label',{class:'fld',style:'display:flex;gap:8px;align-items:center;cursor:pointer'},
-    el('input',{type:'checkbox',checked:s.advanced,onchange:e=>{ s.advanced=e.target.checked; render(); }}), 'Coin control: choose which coins may be spent');
+    el('input',{type:'checkbox',checked:s.advanced,onchange:e=>{ s.advanced=e.target.checked; clearMax(); render(); }}), 'Coin control: choose which inputs (coins) may be spent');
   const advBlock = el('div',{});
   if(s.advanced){
     if(!s.utxos){ const lb=el('button',{class:'btn ghost sm'},'Load coins'); lb.addEventListener('click',()=>loadCoinControl(lb)); advBlock.append(lb); }
@@ -3151,7 +3177,7 @@ function renderSend(){
       const t=el('table',{}, el('thead',{}, el('tr',{}, el('th',{},''), el('th',{},'UTXO'), el('th',{class:'amt'},'Value'))));
       const tb=el('tbody',{});
       for(const u of s.utxos){ const op=u.txid+':'+u.vout;
-        const cb=el('input',{type:'checkbox',checked:!!s.selected[op],onchange:e=>{ s.selected[op]=e.target.checked; }});
+        const cb=el('input',{type:'checkbox',checked:!!s.selected[op],onchange:e=>{ s.selected[op]=e.target.checked; clearMax(); }});   // changing the input selection invalidates a cached max
         tb.append(el('tr',{}, el('td',{},cb), el('td',{class:'addr'}, op + (u.status&&u.status.confirmed?'':' (unconfirmed)')), el('td',{class:'amt'}, fmt(u.value)+' '+c.ticker))); }
       t.append(tb); advBlock.append(el('p',{class:'sub'},'Only checked coins may be spent; the wallet picks the smallest set that covers the amount and fee. Leave all unchecked to choose coins automatically.'), t);
     }
@@ -3167,6 +3193,7 @@ function renderSend(){
   return el('div',{class:'card'},
     el('div',{class:'card-h'}, 'Send '+c.ticker, el('span',{class:'sub'}, TYPES[state.addrType].label+' · balance '+fmt(state.totalSats)+' '+c.ticker)),
     el('div',{class:'card-b stack'},
+      advToggle, advBlock,
       el('div',{class:'between'}, el('span',{class:'sub'},'Recipients'),
         el('div',{class:'row',style:'flex:1;justify-content:flex-end;align-items:center;gap:6px'}, el('span',{class:'sub'},'amount in'), denomPills)), recipWrap,
       el('button',{class:'btn ghost sm',style:'align-self:flex-start',onclick:()=>{ s.recipients.push({address:'',amount:''}); render(); }},'+ Add recipient'),
@@ -3178,7 +3205,6 @@ function renderSend(){
       el('div',{class:'field'},
         el('div',{class:'between'}, el('label',{class:'fld',style:'margin:0'},'Fee'), feePresets),
         el('div',{class:'row',style:'align-items:center;flex:0;margin-top:6px'}, feeInput, el('span',{class:'sub'},'sat/vB'), suggestBtn)),
-      advToggle, advBlock,
       el('div',{class:'row',style:'flex:0'}, reviewBtn, psbtBtn), psbtOut,
       s.error ? el('div',{class:'msg bad'}, s.error) : null,
     ));
@@ -4370,7 +4396,7 @@ function handleDeepLink(){
     } else {
       const p = parseBip21(raw);
       if(!isValidAddress(p.address, coin)){ toast('That link had an invalid address','warn'); cleanUrl(); return; }
-      if(state.coin!==coin){ state.coin=coin; _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); }
+      if(state.coin!==coin){ state.coin=coin; clearMax(); _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); }
       state.send.recipients = [{ address:p.address, amount:p.amount||'' }];
       state.send.advanced=false; state.send.selected={}; state.send.utxos=null;
       state.tab='send'; render(); refresh();
