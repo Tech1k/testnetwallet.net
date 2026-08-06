@@ -5,7 +5,7 @@
  *
  * Crypto: @scure/btc-signer (addresses, PSBT), @scure/bip32 (HD), @scure/bip39 (mnemonic),
  *         @noble/secp256k1 + sha256 (message signing). All vendored, no build step, no CDN.
- * Data:   public Esplora APIs (mempool.space/testnet4, litecoinspace.org/testnet).
+ * Data:   Esplora APIs: mempool.space/testnet4 (BTC) and self-hosted testnetscan.com (LTC).
  */
 import * as btc from './vendor/btc-signer.mjs';
 import { HDKey } from './vendor/bip32.mjs';
@@ -43,8 +43,7 @@ const COINS = {
         explorer:'https://mempool.space/testnet4' },
   ltc:{ name:'Litecoin', ticker:'tLTC', priceSym:'LTC', color:'#345d9d', enabled:true, uri:'litecoin',
         msgPrefix:'Litecoin Signed Message:\n',
-        net: LTC_TESTNET, api:'https://testnetscan.com/ltc-testnet/api',   // self-hosted electrs-ltc Esplora API; paths are /{coin}-{net}/api (see testnetscan.com/docs)
-        apiFallback:'https://litecoinspace.org/testnet/api',               // auto-fallback when testnetscan errors (5xx/timeout); already in CSP
+        net: LTC_TESTNET, api:'https://testnetscan.com/ltc-testnet/api',   // self-hosted electrs-ltc Esplora API; paths are /{coin}-{net}/api (see testnetscan.com/docs). No third-party fallback: litecoinspace testnet can be unreliable; a lag is surfaced by the tip-staleness check instead.
         explorer:'https://testnetscan.com/ltc-testnet' },
   xmr:{ name:'Monero', ticker:'XMR', priceSym:'XMR', color:'#ff6600', enabled:false, uri:'monero', addrModel:'monero',
         explorers:{ stagenet:'https://xmr-stagenet.librenode.com', testnet:'https://xmr-testnet.librenode.com' } }, // keys are pure-JS; balance/history/send/sign run through the lazy-loaded node engine. enabled set true at boot iff self-test passes.
@@ -274,36 +273,18 @@ function isValidAddress(addr, coin){
 
 /* ----------------------------- Esplora data layer ----------------------------- */
 // Base URL for a coin's Esplora API: a user-set self-hosted override (Settings) or the built-in default.
-let _apiCooldown = {};                                                    // coin -> ts: after the primary API fails, prefer its fallback until this time
-function apiBases(coin){                                                  // ordered origins to try: [primary, fallback?]; a user override opts out of auto-fallback
-  const override = store.settings && store.settings.api && store.settings.api[coin];
-  if(override) return [override];
-  const c = COINS[coin]; const list = c.apiFallback ? [c.api, c.apiFallback] : [c.api];
-  if(list.length > 1 && _apiCooldown[coin] && Date.now() < _apiCooldown[coin]) return [list[1], list[0]];   // primary recently failed -> try fallback first (still re-probe primary)
-  return list;
-}
-function apiBase(coin){ return apiBases(coin)[0]; }                       // currently-preferred origin (used by broadcast / tip / prevout-hex)
+function apiBase(coin){ return (store.settings && store.settings.api && store.settings.api[coin]) || COINS[coin].api; }   // one origin: the coin's API (or a Settings override). No third-party fallback; explorer lag is surfaced by the tip-staleness check.
 async function apiGet(coin, path, signal){
-  const bases = apiBases(coin); const c = COINS[coin]; let lastErr;
-  for(let k = 0; k < bases.length; k++){
-    const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 12000);
-    const onAbort = () => ac.abort('superseded');                        // a superseded scan cancels this in-flight request
-    if(signal){ if(signal.aborted) ac.abort('superseded'); else signal.addEventListener('abort', onAbort, { once:true }); }
-    try {
-      const r = await fetch(bases[k] + path, { signal: ac.signal });
-      if(!r.ok) throw new Error('HTTP '+r.status);
-      const ct = r.headers.get('content-type') || '';
-      if(!ct.includes('json')) throw new Error('unexpected response');
-      const data = await r.json();
-      if(bases.length > 1 && bases[k] === c.api) delete _apiCooldown[coin];   // primary healthy -> resume normal (primary-first) order
-      return data;
-    } catch(e){
-      lastErr = e;
-      if(!(signal && signal.aborted) && bases.length > 1 && bases[k] === c.api) _apiCooldown[coin] = Date.now() + 60000;   // REAL primary failure (not a deliberate abort) -> prefer fallback ~60s, then it EXPIRES so the primary is re-probed
-      if((signal && signal.aborted) || k === bases.length - 1) throw e;  // aborted on purpose, or out of candidates -> give up
-    } finally { clearTimeout(t); if(signal) signal.removeEventListener('abort', onAbort); }
-  }
-  throw lastErr;
+  const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 12000);
+  const onAbort = () => ac.abort('superseded');                          // a superseded scan cancels this in-flight request
+  if(signal){ if(signal.aborted) ac.abort('superseded'); else signal.addEventListener('abort', onAbort, { once:true }); }
+  try {
+    const r = await fetch(apiBase(coin) + path, { signal: ac.signal });
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const ct = r.headers.get('content-type') || '';
+    if(!ct.includes('json')) throw new Error('unexpected response');
+    return await r.json();
+  } finally { clearTimeout(t); if(signal) signal.removeEventListener('abort', onAbort); }
 }
 async function getStats(coin, addr, signal){
   const s = await apiGet(coin, '/address/'+encodeURIComponent(addr), signal);
@@ -332,22 +313,13 @@ async function getUtxos(coin, addr){
   return u;
 }
 async function broadcast(coin, hex){
-  const bases = apiBases(coin); const c = COINS[coin]; let lastErr;   // same primary->fallback failover as apiGet, for the broadcast write path
-  for(let k = 0; k < bases.length; k++){
-    const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 15000);
-    try {
-      const r = await fetch(bases[k] + '/tx', { method:'POST', body: hex, signal: ac.signal });
-      const txt = (await r.text()).trim();
-      if(!r.ok) throw new Error(txt || ('HTTP '+r.status));
-      if(bases.length > 1 && bases[k] === c.api) delete _apiCooldown[coin];
-      return txt;
-    } catch(e){
-      lastErr = e;
-      if(bases.length > 1 && bases[k] === c.api) _apiCooldown[coin] = Date.now() + 60000;
-      if(k === bases.length - 1) throw e;
-    } finally { clearTimeout(t); }
-  }
-  throw lastErr;
+  const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 15000);
+  try {
+    const r = await fetch(apiBase(coin) + '/tx', { method:'POST', body: hex, signal: ac.signal });
+    const txt = (await r.text()).trim();
+    if(!r.ok) throw new Error(txt || ('HTTP '+r.status));
+    return txt;
+  } finally { clearTimeout(t); }
 }
 /* CypherFaucet API (the sibling faucet) - keyless, rate-limited, CORS-friendly. One-click in-wallet claiming. */
 const FAUCET = 'https://cypherfaucet.com';
@@ -425,6 +397,7 @@ async function getPrice(sym, fiat){
   if(v != null) _priceCache[key] = { ts: now, value: v };
   return v;
 }
+const STALE_BLOCKS = 6;   // LTC: warn if testnetscan's tip lags our own node by more than this (two independent nodes differ by a few blocks on bursts; paired with a 2-read hysteresis)
 async function getTipHeight(coin){
   const ac = new AbortController(); const t = setTimeout(()=>ac.abort('timeout'), 10000);
   try { const r = await fetch(apiBase(coin) + '/blocks/tip/height', { signal: ac.signal });
@@ -896,7 +869,21 @@ async function refresh(){
     }
   }
   getPrice(COINS[state.coin].priceSym, state.fiat).then(p => { if(seq===state.refreshSeq){ state.price = p; render(); } });
-  getTipHeight(state.coin).then(h => { if(seq===state.refreshSeq && h){ state.tipHeight = h; render(); } });
+  const prevTip = state.tipHeight, prevStaleB = state.ltcStale ? state.ltcStale.behind : null;
+  getTipHeight(state.coin).then(async h => {
+    if(seq !== state.refreshSeq) return;
+    if(h) state.tipHeight = h;
+    if(state.coin==='ltc' && !isMweb() && h!=null && mwebNodeUrl()){   // cross-check the explorer tip vs our own node (litecoind) to flag a lagging/stale explorer
+      const nt = await mwebNode.getTip(mwebNodeUrl(), ab.signal).catch(()=>null);
+      if(seq !== state.refreshSeq) return;
+      const nodeT = (nt && (nt.chain==null || String(nt.chain).includes('test'))) ? nt.height : null;   // only trust a testnet node tip (guards a mis-pointed node override)
+      const behind = (nodeT!=null) ? nodeT - h : 0;
+      state._ltcStaleHits = behind > STALE_BLOCKS ? (state._ltcStaleHits||0)+1 : 0;   // hysteresis: 2 consecutive lagging reads before warning (no flapping on a transient block burst), cleared instantly once caught up
+      state.ltcStale = state._ltcStaleHits >= 2 ? { behind } : null;
+    } else { state.ltcStale = null; state._ltcStaleHits = 0; }
+    const nowStaleB = state.ltcStale ? state.ltcStale.behind : null;
+    if(state.tipHeight !== prevTip || nowStaleB !== prevStaleB) render();   // only re-render when the tip or staleness actually changed (avoids needless background renders)
+  });
 }
 
 /* ============================== RENDER ============================== */
@@ -1135,6 +1122,7 @@ function renderBalance(){
         el('span',{class:'sub',style:'display:inline-flex;align-items:center;gap:7px'}, el('img',{class:'coin-ico',src:'icons/'+state.coin+'.svg',alt:''}), c.name+' · '+TYPES[state.addrType].label),
         el('div',{class:'row',style:'flex:1;justify-content:flex-end;align-items:center;gap:8px'}, eye,
           el('button',{class:'btn ghost sm',onclick:refresh,title:'Refresh','aria-label':'Refresh balance'},'↻'))),
+      (state.coin==='ltc' && state.ltcStale) ? el('div',{class:'msg warn',style:'margin:8px 0 0;text-align:left'}, 'Explorer is ~' + state.ltcStale.behind + ' blocks behind your node; balance and history may be stale until it catches up.') : null,
       bal,
       state.hideBalance ? null : fiat,
       (pending>0 && !state.hideBalance) ? el('div',{class:'sub warn',style:'margin-top:4px'}, fmt(pending)+' '+c.ticker+' pending · '+fmt(state.confirmedSats)+' '+c.ticker+' available') : null,

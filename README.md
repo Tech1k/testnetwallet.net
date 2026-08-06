@@ -6,7 +6,7 @@ It's one of a few testnet tools: [CypherFaucet](https://cypherfaucet.com) (fauce
 
 ## Networks
 - Bitcoin testnet4, via mempool.space for the explorer and API
-- Litecoin testnet, via litecoinspace.org
+- Litecoin testnet (incl. MWEB), via self-hosted testnetscan.com
 - (in development - working beta) Monero stagenet/testnet: full wallet - addresses are derived pure-JS from your recovery phrase, and balance, history, sending, sweep, message signing and payment proofs run self-custodially through a lazy-loaded WASM engine talking directly to a node (no light-wallet server)
 - Litecoin **MWEB** (MimbleWimble Extension Blocks): `tmweb` stealth addresses, balance and transaction history derived from the same recovery phrase and scanned client-side via a small self-hostable PHP helper that fronts a Litecoin Core node (no third-party indexer, no light-wallet server), plus sending - private MWEB-to-MWEB and peg-out to a transparent Litecoin address - with the 64-bit range proof built in your browser by a lazy-loaded WASM prover.
 
@@ -69,7 +69,7 @@ TestnetWallet is © 2026 Tech1k, licensed under **AGPL-3.0-or-later** (full text
 
 It began as a fork of [blt-wallet](https://github.com/sereneblue/blt-wallet) by sereneblue (MIT) but has since been rewritten from scratch; no original blt-wallet code remains. The credit is kept as a matter of history.
 
-Block explorer data comes from mempool.space (Bitcoin) and litecoinspace.org (Litecoin); mainnet prices from CoinGecko, with a Coinbase fallback.
+Block explorer data comes from mempool.space (Bitcoin) and self-hosted testnetscan.com (Litecoin); mainnet prices from CoinGecko, with a Coinbase fallback.
 
 ### Third-party code
 The libraries in `vendor/` are bundled under their own licenses:
