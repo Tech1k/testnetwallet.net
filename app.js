@@ -19,6 +19,7 @@ import * as xmrSeed from './monero-mnemonic.mjs';
 import * as moneroEngine from './monero-engine.mjs';   // lazy: only fetches the ~6MB bundle on first balance/send
 import * as mweb from './mweb.mjs';                     // Litecoin MWEB crypto: receive + send (BLAKE3, pure-JS)
 import * as mwebNode from './mweb-node.mjs';            // MWEB data layer: Litecoin Core REST, scanned client-side
+import * as swap from './swap/swap.mjs';                // TestnetSwap in-wallet exchange (atomic swaps); vendored engine in swap/
 
 /* Clickjacking guard. A frame-ancestors directive in a <meta> CSP is ignored by browsers,
  * so for static hosting we bust out of frames here (a key-revealing wallet shouldn't be embeddable). */
@@ -84,6 +85,9 @@ function timeAgo(sec){
   return d+'s ago';
 }
 function normalizePhrase(p){ return p.trim().toLowerCase().replace(/\s+/g,' '); }
+// decodeURIComponent throws a URIError on a malformed %-escape; untrusted QR/paste/hash input must degrade
+// gracefully (fall back to the raw string) instead of aborting the scan/paste handler with an uncaught throw.
+function safeDecodeURI(s){ try { return decodeURIComponent(s); } catch(_){ return String(s); } }
 let _clipClearTimer = null;
 // attrs that keep secret text out of cloud spellcheck / autofill / autocapitalize
 const SECRET_ATTRS = { spellcheck:'false', autocapitalize:'none', autocorrect:'off', autocomplete:'off' };
@@ -158,6 +162,14 @@ function saveStore(){ _writeChain = _writeChain.then(saveStoreNow).catch(e => { 
   const now = Date.now();
   if(now - _saveWarnAt > 20000){ _saveWarnAt = now; try { toast('Couldn’t save to this browser’s storage (it may be full). Recent changes may not persist - back up your wallet.', 'bad'); } catch(_){} }
 }); }
+// Awaitable variant for the swap engine's fail-closed persistence: resolves only after the actual disk
+// write and REJECTS (does not swallow) on failure, so a swap aborts BEFORE locking/funding if it can't
+// durably save its reclaim blob. Still serialized on the one write-chain so ordering holds.
+// TOCTOU close: saveStoreNow RESOLVES-without-writing when the vault is locked (_encOn && !_cryptoKey). A
+// lock landing AFTER the caller's synchronous guard but BEFORE this queued write would otherwise report a
+// phantom-durable save. Re-check lock state AFTER the write and REJECT if locked, so an awaited
+// onBeforeLock/onAfterFund can never see a false success and lock funds with no on-disk reclaim blob.
+function saveStoreAwait(){ const p = _writeChain.then(saveStoreNow).then(()=>{ if(_encOn && !_cryptoKey) throw new Error('vault locked before the recovery write committed; aborting to keep funds recoverable'); }); _writeChain = p.catch(()=>{}); return p; }
 
 /* Migrate Monero key/cache blobs between plaintext and encrypted form. On the ENCRYPT pass, a blob that can't be
  * encrypted is DELETED rather than left as a plaintext spend key (recoverable - it re-derives + re-syncs). */
@@ -181,6 +193,7 @@ function runExclusive(fn){ const p = _writeChain.then(fn); _writeChain = p.catch
 
 /* Enable encryption. Self-tests the round-trip, then encrypts the SEED first before the Monero caches. */
 function enableEncryption(password){
+  if(swapBusy() || swap.hasRecovery()) return Promise.reject(new Error('finish or clear your pending swap before changing encryption; re-keying the vault could drop its reclaim key'));   // a whole-vault rewrite from a stale store can clobber a live swap-recovery blob
   return runExclusive(async ()=>{
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const key = await deriveKey(password, salt, KDF_ITER);
@@ -196,6 +209,7 @@ function enableEncryption(password){
 /* Re-key to a NEW password WITHOUT ever writing plaintext: re-encrypt the in-memory store + caches in place. */
 function changePassword(newPassword){
   if(!_cryptoKey) return Promise.reject(new Error('unlock first'));
+  if(swapBusy() || swap.hasRecovery()) return Promise.reject(new Error('finish or clear your pending swap before changing encryption; re-keying the vault could drop its reclaim key'));
   return runExclusive(async ()=>{
     const oldKey = _cryptoKey;
     const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -215,6 +229,7 @@ function changePassword(newPassword){
 /* Turn encryption off (must be unlocked). Rewrites everything as plaintext - the intended end state here. */
 function disableEncryption(){
   if(!_cryptoKey) return Promise.reject(new Error('unlock first'));
+  if(swapBusy() || swap.hasRecovery()) return Promise.reject(new Error('finish or clear your pending swap before changing encryption; re-keying the vault could drop its reclaim key'));
   return runExclusive(async ()=>{
     const key = _cryptoKey;
     _encOn = false; _cryptoKey = null; _vaultSalt = null; _locked = false;
@@ -234,10 +249,29 @@ async function unlockVault(vault, password){
 }
 /* Soft lock: keep the key + decrypted seed in memory, gate the UI behind the session PIN (fast re-entry). */
 function softLock(){ if(!_pin || !_cryptoKey){ lockWallet(); return; } _softLocked = true; closeModal(); render(); }
+// A swap is actively running (persist -> lock/fund -> clear window). A FULL lock or wallet switch here can
+// strand funds (wipes the key / misroutes the reclaim blob); soft-lock is safe (keeps the key + wallet).
+function swapBusy(){ return !!((state.swap && state.swap.busy) || (state.swapHt && state.swapHt.busy)); }
+// Cross-tab single-slot mutex for a swap START. The per-wallet recovery slot is single, but state.*.busy is
+// per-tab (invisible to other tabs) and hasRecovery() only interlocks AFTER a blob is persisted - so two
+// tabs on the SAME wallet can both pass the entry checks in the setup window and then mutually clobber the
+// one slot, stranding the loser's random reclaim key. Web Locks give a real cross-tab mutex, held for the
+// whole swap and auto-released on tab close (after which the persisted-blob hasRecovery() interlock takes
+// over). Refuse a concurrent same-wallet swap rather than silently share the slot. Browsers without Web
+// Locks degrade to the in-tab interlock only (that narrow two-tab START race remains there).
+function withSwapLock(fn){
+  if(!(typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request)) return Promise.resolve().then(fn);
+  const name = 'tnw-swap-' + ((state.wallet && state.wallet.id) || 'none');
+  return navigator.locks.request(name, { ifAvailable:true }, (lock)=>{
+    if(!lock){ const e = new Error('a swap is already running on this wallet in another tab'); e.swapLockBusy = true; throw e; }
+    return fn();
+  });
+}
 function lockWallet(){   // FULL lock: wipe the in-memory key + decrypted seed + PIN + sensitive state, require the password
   _cryptoKey = null; _locked = true; _pin = null; _softLocked = false;
   _discoverTok++; _cancelRefresh();   // abort in-flight gap-scan + refresh AND release the refresh machine, so a locked wallet stops querying and unlock refreshes cleanly
   state.master = null; state.wallet = null; state.xmrKeys = null; state.mwebKeys = null; state.mwebSend = null; state.watchOnly = false; state.addresses = [];
+  state.swap = null; state.swapHt = null;   // drop any in-memory swap draft/receipt on lock (the recovery blob stays in the vault)
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };
   state.mweb = { syncing:false, synced:false, scannedTo:0, tip:0, start:0, height:0, ownedCount:0, balance:null, owned:null, spent:null, txs:[], error:null, node:null, price:null, _autoTried:false };   // wipe MWEB keys + scan cache too
   store = {};   // drop the only reference to the decrypted mnemonics/passphrases; unlockVault repopulates it
@@ -427,6 +461,8 @@ const state = {
   send:{ recipients:[{address:'',amount:''}], opReturn:'', opReturnHex:false, feeRate:null, advanced:false, utxos:null, selected:{}, busy:false },
   tools:{ signIndex:0, signType:'', keyIndex:0, message:'', signature:'', signAddr:'', vAddr:'', vMsg:'', vSig:'', vResult:null, showKey:false, valAddr:'', valResult:null, sweepWif:'', sweepDest:'', sweepFee:'' },
   dev:{ decodeInput:'', decoded:null, decodeErr:null, rawTx:'', qrAddr:'', qrAmount:'', qrLabel:'', xpub:'', xpubType:'wpkh', psbt:'' },
+  swap:null,             // XMR->settle swap form/run state (lazily created by swapState())
+  swapHt:null,           // HTLC (tLTC<->tBTC) swap form/run state (lazily created by htlcState())
 };
 
 /* ----------------------------- wallet lifecycle ----------------------------- */
@@ -481,7 +517,14 @@ function buildMwebAddresses(){
   catch(e){ state.addresses = []; state.error = 'Could not derive MWEB addresses: '+(e.message||e); }
 }
 function openWallet(w){
+  // Never switch wallets out from under a RUNNING swap: the swap holds this wallet's ephemeral keys and
+  // persists its reclaim blob under this wallet's id (adapter keys on state.wallet.id); a mid-flight switch
+  // would misroute the blob and strand funds. Only a live (busy) swap blocks; a stale receipt/recovery never does.
+  if(state.wallet && state.wallet.id !== w.id && ((state.swap && state.swap.busy) || (state.swapHt && state.swapHt.busy))){
+    toast('Finish or reclaim your running swap before switching wallets','warn'); return;
+  }
   _lastBal = null; _lastPending = new Set();                 // don't flash/settle across a wallet switch
+  if(!state.wallet || state.wallet.id !== w.id){ state.swap = null; state.swapHt = null; }   // reset drafts/receipts only on an ACTUAL switch; a same-wallet re-open must NOT wipe a live swap's busy tracker (would re-expose the form -> double-swap clobbering the single slot)
   state.wallet = w;
   if(w.viewKey){                                             // watch-only MWEB wallet (view key only, no seed)
     state.scheme = 'bip39'; state.watchOnly = true; state.master = null; state.xmrKeys = null;
@@ -894,6 +937,7 @@ function render(){
   if(!state.wallet){ clear(view).append(renderOnboarding()); return; }
   const y = window.scrollY;                              // rebuilding #view collapses its height, clamping scroll to the top; restore it so a tab/pill click or a background refresh doesn't yank the page up
   const parts = [renderControls(), renderBalance()];
+  if(state.tab==='swap' && !swapAvailable()) state.tab='receive';   // normalize BEFORE the tab bar builds, so a hidden Swap tab never leaves the bar with no active tab
   if(state.addresses.length) parts.push(renderTabs(), renderPanel());
   else parts.push(el('div',{class:'card'}, el('div',{class:'card-b'}, el('p',{class:'bad'}, state.error || 'No addresses available.'))));
   clear(view).append(...parts);
@@ -1131,7 +1175,541 @@ function renderBalance(){
     ));
 }
 
+/* =============================== Swap (TestnetSwap exchange) =============================== */
+// A Cake-style in-wallet exchange: swap between the coins you hold, non-custodially, over the
+// TestnetSwap atomic-swap network. The wallet is the taker; it funds from your own balance and the
+// received coin lands at your own address. Engine + glue live in swap/ (swap.mjs + vendored toolkit).
+// Direction now: XMR -> tBTC/tLTC (adaptor swap; the Monero lock is sent from your open wallet).
+const SWAP_SETTLE = ['tBTC', 'tLTC'];                       // what XMR can swap into
+// Operator kill-switch for the whole Swap feature. Set false to hide the Swap tab until testnetswap.com is
+// live (or during an outage). A pending recovery still surfaces the tab regardless, so any in-flight funds
+// stay reachable. (Runtime relay reachability is handled separately by the friendly "no one is offering" message.)
+const SWAP_ENABLED = true;
+function swapAvailable(){ return SWAP_ENABLED || swap.hasRecovery(); }
+function swapState(){ return state.swap || (state.swap = { to: 'tBTC', amount: '', quote: null, quoting: false, busy: false, done: null, phase: null, note: '', steps: {}, err: null }); }
+function swapReset(){ state.swap = { to: 'tBTC', amount: '', quote: null, quoting: false, busy: false, done: null, phase: null, note: '', steps: {}, err: null }; }
+function xmrFromTicker(){ return state.xmrNet === 'stagenet' ? 'sXMR' : 'tXMR'; }
+
+/* Unified wallet-native Swap page: one From -> To surface, protocol auto-selected (either side Monero ->
+ * adaptor; both UTXO -> HTLC), with a SINGLE global recovery surface (an unfinished swap of any kind shows +
+ * resumes here regardless of the current From). Reuses every audited handler + the engine unchanged. */
+function renderSwap(){
+  const isXmr = COINS[state.coin].addrModel === 'monero';
+  const s = isXmr ? swapState() : htlcState();
+  const rk = swap.recoveryKind();
+  const otherBusy = isXmr ? !!(state.swapHt && state.swapHt.busy) : !!(state.swap && state.swap.busy);
+  const parts = [];
+  // (1) GLOBAL recovery surface: an unfinished swap of EITHER kind is shown + resumable here, on any From -
+  //     but NEVER while that swap is still BUSY in this tab (its Clear/Reclaim/Finish would race + clobber the
+  //     live driver's single blob; the tracker in branch 2 owns the screen then). A failed swap drops busy to
+  //     false with the blob persisted, so the card appears exactly when acting on it is safe.
+  if(rk === 'xmr' && !(state.swap && state.swap.busy)) parts.push(renderSwapRecovery());
+  else if(rk === 'htlc' && !(state.swapHt && state.swapHt.busy)) parts.push(renderHtlcRecovery(swap.getRecovery()));
+  // (2) A running swap / receipt for THIS direction owns the panel (it states its own direction).
+  if(s.busy || s.done){ parts.push(isXmr ? renderXmrSwap() : renderHtlcSwap()); return el('div',{class:'stack'}, ...parts); }
+  // (3) Single slot: a pending swap of any kind blocks a new one; the recovery card above is the action surface.
+  if(rk || otherBusy){ parts.push(singleSlotNotice(rk || (isXmr ? 'htlc' : 'xmr'))); return el('div',{class:'stack'}, ...parts); }
+  // (4) Idle: the quote/swap form (which leads with the From -> To selector row).
+  parts.push(isXmr ? renderXmrSwap() : renderHtlcSwap());
+  return el('div',{class:'stack'}, ...parts);
+}
+// The From -> To selector ROW, embedded at the top of the idle form card. From lists BOTH Monero networks
+// (sXMR/tXMR) + the UTXO coins and, on change, switches the active-coin CONTEXT (and Monero network) so
+// gatherInputs/derivation line up; the pair auto-selects the protocol. To is the settle coin (a real select
+// on the XMR path; a fixed, matched, disabled select on the HTLC path). Only rendered when idle (not busy).
+function renderSwapDirRow(){
+  const isXmr = COINS[state.coin].addrModel === 'monero';
+  const fopts = [];
+  if(COINS.xmr && COINS.xmr.enabled && !state.watchOnly && state.xmrKeys){ fopts.push(['xmr:stagenet','sXMR']); fopts.push(['xmr:testnet','tXMR']); }   // both Monero networks (the engine syncs one at a time; picking one switches + re-syncs)
+  if(COINS.btc && COINS.btc.enabled) fopts.push(['btc', COINS.btc.ticker]);
+  if(COINS.ltc && COINS.ltc.enabled) fopts.push(['ltc', COINS.ltc.ticker]);
+  const fromVal = isXmr ? ('xmr:'+state.xmrNet) : state.coin;
+  if(!fopts.some(o => o[0] === fromVal)) fopts.unshift([fromVal, isXmr ? xmrFromTicker() : COINS[state.coin].ticker]);   // always include the current From
+  const fromSel = el('select'); fromSel.disabled = state.watchOnly;
+  for(const [v,l] of fopts) fromSel.append(el('option',{value:v, ...(v===fromVal?{selected:true}:{})}, l));
+  fromSel.addEventListener('change', e=>{ const val = e.target.value, pc = state.coin, pn = state.xmrNet;
+    if(val.slice(0,4) === 'xmr:'){ const net = val.slice(4); if(state.xmrNet !== net) switchXmrNet(net); if(state.coin !== 'xmr') switchCoin('xmr'); }
+    else if(val !== state.coin) switchCoin(val);
+    if(state.coin === pc && state.xmrNet === pn) render(); });   // switch refused (e.g. Monero mid-sync) -> re-render so the select reverts to the true state
+  let toSel;
+  if(isXmr){
+    const s = swapState();
+    toSel = el('select');
+    for(const t of SWAP_SETTLE) toSel.append(el('option',{value:t, ...(t===s.to?{selected:true}:{})}, t));
+    toSel.addEventListener('change', e=>{ s.to = e.target.value; s.quote = null; render(); });
+  } else {
+    // HTLC counter-coin is fixed by From: render a read-only field styled like the From select's box (muted,
+    // non-interactive) rather than a greyed disabled dropdown, so From/To read as a clean matched pair.
+    toSel = el('div',{style:'width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-sm);padding:.6em .7em;font-size:14px;color:var(--muted);box-sizing:border-box'}, htlcToCoin());
+  }
+  const row = el('div',{class:'row',style:'align-items:flex-end;gap:10px;flex-wrap:nowrap'},
+    el('div',{class:'field',style:'flex:1;min-width:0;margin:0'}, el('label',{class:'fld'},'From'), fromSel),
+    el('span',{class:'sub',style:'flex:0;padding-bottom:.6em;font-size:1.15em'}, '→'),
+    el('div',{class:'field',style:'flex:1;min-width:0;margin:0'}, el('label',{class:'fld'},'To'), toSel));
+  const caption = isXmr
+    ? 'Changing From switches the wallet to that coin.'
+    : 'Changing From switches the wallet to that coin. '+htlcFromCoin()+' pairs with '+htlcToCoin()+' only; Monero can only be a source here, not a destination.';
+  return el('div',{class:'stack',style:'gap:6px'},
+    el('div',{class:'sub'}, 'Swap one testnet coin for another, non-custodially. Usually a few minutes while it waits for confirmations - keep this tab open.'),
+    row,
+    el('div',{class:'sub faint',style:'font-size:12px'}, caption));
+}
+function singleSlotNotice(rk){
+  const kind = rk === 'xmr' ? 'Monero' : 'Bitcoin/Litecoin';
+  return el('div',{class:'card'}, el('div',{class:'card-h'},'One swap at a time'),
+    el('div',{class:'card-b stack'}, el('p',{class:'sub'},'You have a '+kind+' swap in progress or awaiting recovery. Finish or reclaim it before starting another - only one swap runs at a time.')));
+}
+
+// map the driver's onStatus phases to a 4-step tracker
+function swapApplyPhase(s, phase, note, meta){
+  const from = xmrFromTicker(), to = s.to;
+  if(phase === 'maker_locked' || phase === 'confirming') s.steps.maker = 'done';
+  if(phase === 'maker_locked') s.steps.confirm = 'active';
+  if(phase === 'confirming') { s.steps.confirm = 'active'; if(meta && meta.txid) s.makerTx = meta.txid; }
+  if(phase === 'locking_xmr'){ s.steps.maker='done'; s.steps.confirm='done'; s.steps.deposit='active'; }   // your XMR is being sent to the lock: its own visible step so the send isn't dead-air
+  if(phase === 'xmr_locked' || phase === 'redeeming'){ s.steps.maker='done'; s.steps.confirm='done'; s.steps.deposit='done'; s.steps.redeem='active'; }
+  if(phase === 'done'){ s.steps.maker='done'; s.steps.confirm='done'; s.steps.deposit='done'; s.steps.redeem='done'; }
+  if(!s.steps.maker) s.steps.maker = 'active';
+}
+// The vendored XMR driver emits progress notes with HARDCODED coin names (tBTC/tXMR); for e.g. an sXMR->tLTC
+// swap that names the wrong coins. Derive the note from the app's real from/to for the coin-specific phases;
+// coin-agnostic driver notes (setup/resuming/...) return null here and pass through unchanged.
+function swapNote(phase, from, to){
+  switch(phase){
+    case 'maker_locked': return 'The other side locked your ' + to;
+    case 'confirming': return 'Confirming the ' + to + ' lock on-chain';
+    case 'locking_xmr': return 'Locking your ' + from + '…';
+    case 'xmr_locked': return 'Your ' + from + ' is locked; finishing the swap';
+    case 'redeeming': return 'Receiving your ' + to;
+    case 'done': return 'Received ' + to;
+    default: return null;
+  }
+}
+// Same idea for the HTLC path, whose live notes come from the vendored taker and say "maker".
+function htlcNote(phase, from, to){
+  switch(phase){
+    case 'waiting': return 'Waiting for the other side to lock ' + to;
+    case 'maker_locked': return 'The other side locked ' + to;
+    case 'confirming': return 'Confirming the ' + to + ' lock on-chain';
+    case 'redeeming': return 'Receiving your ' + to;
+    case 'done': return 'Received ' + to;
+    default: return null;
+  }
+}
+// Collapse raw relay/transport/timeout errors (the common "no counterparty online" case) into one friendly,
+// actionable line; genuine non-network reasons pass through so they still surface.
+function swapNetErr(e){
+  // Prefer the maker's machine-readable code (the vendored relay transport attaches the whole message as
+  // e.relayError) over string-sniffing; fall back to the message regex for UNCODED errors (relay drops,
+  // driver aborts, timeouts, which do not carry a code yet).
+  const code = e && e.relayError && e.relayError.code;
+  const CODES = {
+    no_liquidity: 'the maker is out of liquidity for this pair right now - try a smaller amount or again later',
+    rate_limited: 'the maker is busy right now - try again shortly',
+    maker_at_capacity: 'the maker is at capacity right now - try again shortly',
+    peer_at_capacity: 'you already have too many swaps in flight with this maker - finish one first',
+    amount_too_small: 'that amount is below the maker minimum',
+    amount_out_of_band: 'that amount is outside the maker range',
+    quote_expired: 'the quote expired - get a fresh rate and try again',
+    unknown_quote: 'the quote is no longer valid - get a fresh rate and try again',
+    quote_mismatch: 'the quote changed - get a fresh rate and try again',
+    unsupported_pair: 'the maker does not support this pair',
+    unsupported_network: 'the maker does not serve this Monero network',
+  };
+  if(code && Object.prototype.hasOwnProperty.call(CODES, code)) return CODES[code];    // own-property only: a maker-sent code colliding with a prototype name (toString, __proto__, ...) must fall through to the regex, not return an inherited member
+  const m = String((e && e.message) || e || '');
+  if(/relay|timed?\s*out|timeout|no_liquidity|not open|closed|connect|unreachable|network/i.test(m)) return 'no one is offering this swap right now, or the swap network is unreachable';
+  return m;
+}
+function swapTracker(s){
+  const from = xmrFromTicker(), to = s.to;
+  const STEPS = [['maker','The other side locks '+to],['confirm','Confirming lock'],['deposit','Your '+from+' locks'],['redeem','Receive '+to]];
+  const rows = STEPS.map(([k,label])=>{
+    const st = s.steps[k] || 'pending';
+    const ico = st==='done' ? '✓' : st==='active' ? '◐' : '○';
+    const lbl = (k==='confirm' && st==='active' && s.conf!=null) ? label+' ('+s.conf+'/6)' : label;
+    return el('div',{class:'row',style:'gap:8px;align-items:baseline;opacity:'+(st==='pending'?'.5':'1')}, el('span',{style:'color:'+(st==='done'?'var(--ok)':st==='active'?'var(--warn)':'var(--muted)')}, ico), el('span',{}, lbl));
+  });
+  return el('div',{class:'stack',style:'gap:6px'}, ...rows,
+    s.makerTx ? el('div',{class:'sub',style:'margin-top:2px'}, el('a',{href:swap.explorerTx(to, s.makerTx),target:'_blank',rel:'noopener',class:'mono'}, 'view the lock on-chain ↗')) : null,
+    s.note ? el('div',{class:'sub',style:'margin-top:6px'}, s.note) : null);
+}
+
+function renderXmrSwap(){   // XMR panel: tracker / receipt / form. Recovery + single-slot are composed by renderSwap.
+  const s = swapState();
+  const from = xmrFromTicker(), sx = state.xmr;
+  if(s.busy) return el('div',{class:'card'},
+    el('div',{class:'card-h'}, 'Swapping '+(s.amount||'')+' '+from+' → '+s.to),
+    el('div',{class:'card-b stack'}, swapTracker(s), el('div',{class:'sub faint'},'Keep this tab open until it finishes; the swap runs in your browser.')));
+  if(s.done){
+    const r = s.done;
+    return el('div',{class:'card'},
+      el('div',{class:'card-h'}, '✓ Swap complete'),
+      el('div',{class:'card-b stack'},
+        swapKv('Sent', swap.fmtXmr(r.sentPico)+' '+from),
+        swapKv('Received', el('b',{class:'ok'}, swap.fmtBtc(r.netSats)+' '+r.toCoin)),
+        r.redeemTxid ? swapKv('Receive tx', el('a',{href:swap.explorerTx(r.toCoin, r.redeemTxid),target:'_blank',rel:'noopener',class:'mono'}, String(r.redeemTxid).slice(0,20)+'…')) : null,
+        el('div',{class:'sub faint'}, 'Your '+r.toCoin+' was sent to your wallet. Switch to '+r.toCoin+' to see it.'),
+        el('div',{class:'row',style:'flex:0'}, el('button',{class:'btn',onclick:()=>{ swapReset(); render(); }}, 'Swap again'))));
+  }
+  const synced = sx.synced && sx.wallet;
+  const avail = sx.unlocked != null ? sx.unlocked : sx.balance;
+  const amtIn = el('input',{type:'number',min:'0',step:'0.000000000001',value:s.amount,placeholder:'amount '+from});
+  amtIn.addEventListener('input', e=>{ s.amount = e.target.value; s.quote = null; s.err=null; });   // silent (keep focus); Get rate re-renders
+  const quoteBtn = el('button',{class:'btn ghost'}, s.quoting ? 'Getting rate…' : 'Get rate');
+  quoteBtn.disabled = s.quoting || !(parseFloat(s.amount) > 0);
+  quoteBtn.addEventListener('click', swapXmrQuote);
+  const swapBtn = el('button',{class:'btn'}, 'Swap');
+  swapBtn.disabled = !s.quote || !synced;
+  swapBtn.title = !s.quote ? 'Get a rate first' : (!synced ? 'Sync your Monero wallet first' : '');
+  swapBtn.addEventListener('click', swapXmrRun);
+  const body = el('div',{class:'card-b stack'},
+    renderSwapDirRow(),
+    el('div',{class:'field'}, el('label',{class:'fld'},'You send'), el('div',{class:'row'}, amtIn, el('span',{class:'sub',style:'align-self:center'}, from), el('button',{class:'btn ghost sm',style:'flex:0',onclick:swapXmrMax}, 'Max')), (s.quote ? makerRangeHint(s.quote.min_pico, s.quote.max_pico, from, fmtXmr) : null)),
+    el('div',{class:'field'}, el('label',{class:'fld'},'You receive'), el('div',{class:'row'}, el('div',{class:'mono',style:'flex:1;min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-sm);padding:.6em .7em;font-size:14px;box-sizing:border-box'}, s.quote ? '≈ '+swap.fmtBtc(swap.netSats(s.quote.lock_sats)) : '-'), el('span',{class:'sub',style:'align-self:center'}, s.to))),
+    s.quote ? el('div',{class:'sub'}, 'Rate: 1 '+from+' ≈ '+(s.quote.rate!=null?Number(s.quote.rate).toPrecision(4):'?')+' '+s.to+'  ·  network fee ≈ '+swap.fmtBtc(1000)+' '+s.to) : null,
+    el('div',{class:'row',style:'flex:0'}, quoteBtn, swapBtn),
+    !synced ? el('div',{class:'msg'}, 'Connect & sync your Monero wallet first (Send/Receive tab) so it can build the lock.') : null,
+    s.err ? el('div',{class:'msg bad'}, s.err) : null,
+    el('div',{class:'sub faint'}, 'Non-custodial atomic swap over the ', el('a',{href:'https://testnetswap.com',target:'_blank',rel:'noopener'}, 'TestnetSwap'), ' network. You send '+from+' from this wallet; the '+s.to+' is received at your own address. If it stalls, you reclaim your '+from+'. Testnet only.'));
+  return el('div',{class:'card', id:'swap-card'}, el('div',{class:'card-h'}, 'Swap', el('span',{class:'sub'}, 'non-custodial · testnet'+(synced?' · '+swap.fmtXmr(avail)+' available':''))), body);
+}
+function renderSwapForm(){ render(); }
+function swapKv(k, v){ return el('div',{class:'row',style:'justify-content:space-between'}, el('span',{class:'sub'}, k), (v&&v.nodeType)?v:el('span',{}, v)); }
+
+function renderSwapRecovery(){
+  const r = swap.getRecovery(); if(!r) return null;
+  const from = (r.moneroNetwork === 'stagenet') ? 'sXMR' : 'tXMR', to = r.toCoin || 'tBTC';
+  const msg = el('div',{class:'msg',style:'display:none'});
+  const show = (k,t)=>{ msg.className='msg '+(k||''); msg.textContent=t; msg.style.display=''; };
+  const finishBtn = el('button',{class:'btn'}, 'Finish swap (receive '+to+')');
+  finishBtn.addEventListener('click', ()=>swapXmrFinish(finishBtn, show));
+  const reclaimBtn = el('button',{class:'btn ghost'}, 'Reclaim my '+from);
+  reclaimBtn.addEventListener('click', ()=>swapXmrReclaim(reclaimBtn, show));
+  const clearBtn = el('button',{class:'btn ghost sm'}, 'Clear');
+  clearBtn.addEventListener('click', ()=>{ if(confirm('Clear this unfinished swap? If any '+from+' is still recoverable, this permanently gives up your only way to get it back - only do this if the swap never moved any funds.')){ swap.clearRecovery(); render(); } });
+  return el('div',{class:'card'},
+    el('div',{class:'card-h'}, 'Unfinished Monero swap'),
+    el('div',{class:'card-b stack'},
+      (state.swap && state.swap.err) ? el('div',{class:'msg bad'}, state.swap.err) : null,
+      el('p',{class:'sub'}, 'A '+from+' → '+to+' swap did not finish. Finish it to receive your '+to+', or reclaim your '+from+' if the other side is gone.'),
+      el('div',{class:'row',style:'flex:0'}, finishBtn, reclaimBtn, clearBtn), msg));
+}
+
+/* ---- swap handlers ---- */
+async function swapXmrQuote(){
+  const s = swapState();
+  s.quoting = true; s.err = null; renderSwapForm();
+  try {
+    const q = await swap.getXmrQuote({ fromCoin: xmrFromTicker(), toCoin: s.to, sendPico: Math.round(parseFloat(s.amount) * 1e12) });
+    if(!q.network){ s.err = 'The other side did not confirm which Monero network it serves; cannot quote safely.'; s.quote = null; }
+    else if(q.network !== state.xmrNet){ s.err = 'The other side serves Monero '+q.network+'; your wallet is on '+state.xmrNet+'. Switch your Monero network to match.'; s.quote = null; }
+    else s.quote = q;
+  } catch(e){ s.err = 'Could not get a rate: '+swapNetErr(e)+'.'; s.quote = null; }
+  s.quoting = false; renderSwapForm();
+}
+// Derive swap receive/refund/recovery addresses via the wallet's OWN active scheme+type+account (the
+// only derivation buildAddresses/gatherInputs scan and sign), NOT a hardcoded BIP84 path - otherwise an
+// Electrum-imported (or non-default addrType/account) wallet's swap output lands at an address it can
+// never enumerate or spend, including the T1 refund. toCoin only picks the address encoding.
+function swapReceiveAddr(toCoin){ const key = toCoin === 'tLTC' ? 'ltc' : 'btc'; return addrFromPub(deriveNode(state.addrType, 0).publicKey, key, state.addrType); }
+function xmrPrimaryAddr(){ try { return ((state.coin==='xmr' && state.addresses[0]) ? state.addresses[0].address : null) || xmr.subaddress(state.xmrKeys, xmr.XMR_NETS[state.xmrNet], state.xmrAccount||0, 0); } catch(_){ return ''; } }   // the addresses[0] shortcut is only a Monero address while ON the xmr coin; otherwise derive the XMR subaddress directly
+/* Compact "Maker range" hint shown under a You-send row: the maker's per-swap min/max in the send-coin,
+ * read from the live quote. Backward compatible - renders only what the quote carries (an older maker may
+ * omit min, in which case it degrades to the former "Maker max" line, or nothing if it carries neither). */
+function makerRangeHint(minV, maxV, unit, fmt){
+  if(minV == null && maxV == null) return null;
+  let txt;
+  if(minV != null && maxV != null) txt = 'Maker range: '+fmt(minV)+' to '+fmt(maxV)+' '+unit;
+  else if(maxV != null) txt = 'Maker max: '+fmt(maxV)+' '+unit;
+  else txt = 'Maker min: '+fmt(minV)+' '+unit;
+  return el('div',{class:'sub faint',style:'font-size:12px;margin-top:3px'}, txt);
+}
+/* ---- "Max" clamps to the MAKER'S caps (per-swap max + free receive-coin liquidity), NOT the raw balance: a
+ * wallet can hold far more than one swap allows. Best-effort UX only - the maker re-validates server-side, so a
+ * too-big value just bounces. Reads caps from the quote when present and degrades gracefully when they are not
+ * (both quotes now carry their caps: HTLC min_sats/max_sats/liquidity_free_sats, XMR min_pico/max_pico/free). */
+function computeHtlcMaxSats(q, feeRate){
+  // Leave room for BOTH fees paid out of the confirmed balance: the wallet's OWN deposit tx to the fund
+  // address (mining fee, budget ~500 vB for a handful of inputs) AND the contract-funding headroom
+  // (htlcDepositSats(0,feeRate) = htlcFundFee+200). Deliberately undershoot: an over-Max deposit fails
+  // closed but strands a manual-Clear pre-deposit card, so it is better to err a little low.
+  const overhead = swap.htlcDepositSats(0, feeRate) + Math.ceil(500 * feeRate);
+  let m = Number(state.confirmedSats||0) - overhead;                                   // our side: confirmed spendable minus both fees
+  const cap = q && q.max_sats != null ? Number(q.max_sats) : NaN;
+  if(Number.isFinite(cap)) m = Math.min(m, cap);                                       // maker per-swap cap (ignore a malformed non-numeric field rather than poisoning m to NaN)
+  const rate = (q && q.recv_sats!=null && Number(q.send_sats||0)>0) ? Number(q.recv_sats)/Number(q.send_sats) : (q && q.rate!=null ? Number(q.rate) : null);
+  const freeR = q ? Number(q.liquidity_free_sats) : NaN;
+  if(q && q.liquidity_free_sats != null && Number.isFinite(freeR) && rate > 0) m = Math.min(m, Math.floor(freeR / rate));   // maker's free receive-coin depth / rate
+  return Math.max(0, Math.floor(m));
+}
+async function swapHtlcMax(){
+  const s = htlcState();
+  if(state.watchOnly || !state.master) return toast('This is a watch-only wallet; it cannot fund a swap','warn');
+  if(!(Number(state.confirmedSats||0) > 0)) return toast('No confirmed '+COINS[state.coin].ticker+' to swap','warn');
+  try {
+    const feeRate = Math.min(40, Math.max(2, Math.round(await getFeeRate(state.coin)) || 2));
+    const q = s.quote || await swap.getHtlcQuote({ fromCoin: htlcFromCoin(), toCoin: htlcToCoin(), sendSats: Math.min(100000, Math.max(1000, Number(state.confirmedSats||0))) });   // probe a modest amount just to read the maker caps; keeps an over-max reject from stalling the recv
+    const maxSats = computeHtlcMaxSats(q, feeRate);
+    if(!(maxSats >= 1000)) return toast('Your confirmed '+COINS[state.coin].ticker+' is below the swap minimum','warn');
+    s.amount = fmt8(maxSats); s.quote = null; s.err = null; swapHtlcQuote();   // re-quote for the clamped amount
+  } catch(e){ toast('Could not set a max: '+swapNetErr(e),'warn'); }
+}
+function xmrUnlockedPico(){ const u = state.xmr.unlocked != null ? state.xmr.unlocked : state.xmr.balance; return u != null ? Number(u) : null; }
+function computeXmrMaxPico(q){
+  const unlocked = xmrUnlockedPico(); if(unlocked == null) return 0;
+  let m = unlocked - 1e9;                                                              // leave ~0.001 XMR headroom for the Monero lock-tx fee
+  const cap = q && q.max_pico != null ? Number(q.max_pico) : NaN;
+  if(Number.isFinite(cap)) m = Math.min(m, cap);                                       // maker per-swap cap (a malformed non-numeric field is ignored, never poisons m to NaN)
+  const free = q ? Number(q.free) : NaN, lock = q ? Number(q.lock_sats) : NaN, pico = q ? Number(q.xmr_pico) : NaN;
+  if(q && q.free != null && Number.isFinite(free) && lock > 0 && pico > 0)             // maker free settle-coin depth -> max pico it can fill; divide-first (free/lock) keeps the product small and uses the quote's own pico<->sats ratio, so it is unit-safe
+    m = Math.min(m, Math.floor(free / lock * pico));
+  return Math.max(0, Math.floor(m));
+}
+async function swapXmrMax(){
+  const s = swapState();
+  if(!state.xmr.synced || !state.xmr.wallet) return toast('Sync your Monero wallet first','warn');
+  const u = xmrUnlockedPico(); if(!(u > 0)) return toast('No unlocked '+xmrFromTicker()+' available','warn');
+  try {
+    const q = s.quote || await swap.getXmrQuote({ fromCoin: xmrFromTicker(), toCoin: s.to, sendPico: Math.round(Math.min(u, 1e12)) });
+    const maxPico = computeXmrMaxPico(q);
+    if(!(maxPico > 0)) return toast('Your unlocked '+xmrFromTicker()+' is below the swap minimum','warn');
+    s.amount = fmtXmr(maxPico); s.quote = null; s.err = null; swapXmrQuote();   // re-quote for the clamped amount
+  } catch(e){ toast('Could not set a max: '+swapNetErr(e),'warn'); }
+}
+async function swapXmrRun(){
+  const s = swapState();
+  if(!s.quote) return toast('Get a rate first','warn');
+  if(!state.xmr.synced || !state.xmr.wallet) return toast('Sync your Monero wallet first','warn');
+  // Single recovery slot: never start while an HTLC swap is pending or running (would clobber its blob).
+  if(swap.hasRecovery() || (state.swapHt && state.swapHt.busy)) return toast('Finish or clear your pending swap first','warn');
+  const availPico = state.xmr.unlocked != null ? state.xmr.unlocked : state.xmr.balance;   // guard over-balance BEFORE busy so no tracker/recovery card ever shows for a swap that can't start
+  if(availPico != null && Number(Math.round(parseFloat(s.amount) * 1e12)) > Number(availPico)) return toast('You are trying to send more '+xmrFromTicker()+' than you have available ('+swap.fmtXmr(availPico)+')','warn');
+  try {
+    await withSwapLock(async ()=>{
+      s.busy = true; s.err = null; s.steps = {}; s.note = 'Negotiating with the other side…'; render();
+      const restoreHeight = state.xmr.height || await moneroEngine.getDaemonHeight(xmrNodeUrl());
+      const res = await swap.runXmrSwap({
+        fromCoin: xmrFromTicker(), toCoin: s.to, sendPico: Math.round(parseFloat(s.amount) * 1e12), makerId: null,
+        xmrWallet: state.xmr.wallet, xmrNet: state.xmrNet, nodeUrl: xmrNodeUrl(),
+        btcReceiveAddr: swapReceiveAddr(s.to), xmrRefundAddr: xmrPrimaryAddr(), restoreHeight,
+        minLockSats: s.quote && s.quote.lock_sats,
+        onStatus: (phase, note, meta)=>{ swapApplyPhase(s, phase, note, meta); const n = swapNote(phase, xmrFromTicker(), s.to) || note; if(n) s.note = n; render(); },
+      });
+      s.busy = false; s.done = res; render();
+      if(!state.xmr.syncing) moneroSync();                    // refresh XMR balance after the lock
+    });
+  } catch(e){
+    s.busy = false;
+    if(e && e.swapLockBusy){ toast('A swap is already in progress on this wallet (this or another tab); finish it first','warn'); }
+    else s.err = swap.hasRecovery() ? ('Swap interrupted: '+((e&&e.message)||e)+'. Finish or reclaim below.') : ((e&&e.message)||String(e));
+    render();
+  }
+}
+async function swapXmrFinish(btn, show){
+  btn.disabled = true; show('', 'Reconnecting to finish the swap…');
+  try {
+    const res = await withSwapLock(()=> swap.finishXmrSwap({ recovery: swap.getRecovery(), onStatus: (p,n)=>{ if(n) show('', n); } }));
+    if(res && res.state === 'redeemed' && res.confirmed !== false){ show('ok', 'Finished. '+(res.toCoin||'coin')+' redeemed to your wallet: '+String(res.redeemTxid||'').slice(0,16)+'…'); render(); }
+    else if(res && res.state === 'redeemed'){ show('warn', 'Your '+(res.toCoin||'coin')+' redeem is broadcast but not yet confirmed. Leave this open, or press Finish again shortly to confirm it.'); btn.disabled=false; render(); }
+    else { const rn = res && res.reason; show('warn', rn === 'still_maturing' ? 'Your Monero deposit is still finalizing on-chain (about 10 blocks). Leave this open and press Finish again in a few minutes.' : 'Could not finish the swap right now. Try Finish again, or Reclaim your Monero if it keeps failing.'); btn.disabled=false; }
+  } catch(e){
+    if(e && e.swapLockBusy){ show('warn', 'This swap is already running in another tab; use that tab.'); btn.disabled=false; return; }
+    show('bad', 'Finish failed (safe to retry, or Reclaim): '+((e&&e.message)||e)); btn.disabled=false;
+  }
+}
+async function swapXmrReclaim(btn, show){
+  const r = swap.getRecovery(); if(!r) return;
+  btn.disabled = true; show('', 'Chasing the refund on-chain and sweeping your Monero home…');
+  try {
+    // Reclaim against the BLOB's Monero network + dest, not live state - so it stays correct even if the
+    // active network/coin was toggled after the swap (net + node + sweep dest all come from the recovery).
+    const res = await withSwapLock(()=> swap.reclaimXmrSwap({ recovery: r, xmrNet: r.moneroNetwork || state.xmrNet, nodeUrl: xmrNodeUrl(r.moneroNetwork), xmrDest: r.xmrRefund || xmrPrimaryAddr(), onProgress: (m)=>show('', m) }));
+    if(res && res.state === 'punished') show('ok', 'The other side backed out and never refunded, so its '+(r.toCoin||'coin')+' is now yours: '+res.punishTxid);
+    else show('ok', 'Reclaimed. Monero swept home: '+(((res&&res.sweepTxids)||[]).join(', ')));
+    render();
+  } catch(e){
+    if(e && e.swapLockBusy){ show('warn', 'This swap is already running in another tab; use that tab.'); btn.disabled=false; return; }
+    show('bad', 'Reclaim failed (safe to retry): '+((e&&e.message)||e)); btn.disabled=false;
+  }
+}
+
+/* ================= HTLC (tLTC <-> tBTC) swap tab ================= */
+function htlcState(){ return state.swapHt || (state.swapHt = htlcFresh()); }
+function htlcFresh(){ return { amount:'', quote:null, quoting:false, busy:false, done:null, note:'', steps:{}, err:null, makerTx:null, conf:null }; }
+function htlcReset(){ state.swapHt = htlcFresh(); }
+function htlcFromCoin(){ return COINS[state.coin].ticker; }              // tBTC or tLTC (current tab)
+function htlcToCoin(){ return state.coin === 'btc' ? 'tLTC' : 'tBTC'; }   // the other UTXO coin
+
+function htlcApplyPhase(s, phase, note, meta){
+  const set=(k,v)=>{ s.steps[k]=v; };
+  if(['depositing','deposit_confirming','quoting','locking'].includes(phase)) set('deposit','active');
+  if(phase==='locked' || phase==='waiting'){ set('deposit','done'); set('makerlock','active'); }
+  if(phase==='maker_locked'){ set('deposit','done'); set('makerlock','done'); set('confirm','active'); if(meta && meta.txid) s.makerTx=meta.txid; }
+  if(phase==='confirming'){ set('deposit','done'); set('makerlock','done'); set('confirm','active'); if(meta && meta.confirmations!=null) s.conf=meta.confirmations; }
+  if(phase==='redeeming'){ set('deposit','done'); set('makerlock','done'); set('confirm','done'); set('redeem','active'); }
+  if(phase==='done'){ set('deposit','done'); set('makerlock','done'); set('confirm','done'); set('redeem','done'); }
+  if(!s.steps.deposit) s.steps.deposit='active';
+}
+function htlcTracker(s){
+  const from = htlcFromCoin(), to = htlcToCoin();
+  const STEPS = [['deposit','You send '+from],['makerlock','The other side locks '+to],['confirm','Confirming lock'],['redeem','Receive '+to]];
+  const rows = STEPS.map(([k,label])=>{
+    const st = s.steps[k] || 'pending';
+    const ico = st==='done' ? '✓' : st==='active' ? '◐' : '○';
+    const lbl = (k==='confirm' && st==='active' && s.conf!=null) ? label+' ('+s.conf+'/6)' : label;
+    return el('div',{class:'row',style:'gap:8px;align-items:baseline;opacity:'+(st==='pending'?'.5':'1')}, el('span',{style:'color:'+(st==='done'?'var(--ok)':st==='active'?'var(--warn)':'var(--muted)')}, ico), el('span',{}, lbl));
+  });
+  return el('div',{class:'stack',style:'gap:6px'}, ...rows,
+    s.makerTx ? el('div',{class:'sub',style:'margin-top:2px'}, el('a',{href:swap.explorerTx(to, s.makerTx),target:'_blank',rel:'noopener',class:'mono'}, 'view the lock on-chain ↗')) : null,
+    s.note ? el('div',{class:'sub',style:'margin-top:6px'}, s.note) : null);
+}
+
+function renderHtlcSwap(){   // HTLC panel: tracker / receipt / form. Recovery + single-slot are composed by renderSwap.
+  const from = htlcFromCoin(), to = htlcToCoin(), s = htlcState();
+  if(state.watchOnly || !state.master) return placeholder('Swap '+from, 'This is a watch-only wallet, so it cannot fund a swap. Import the seed to swap '+from+'.');
+  if(s.busy) return el('div',{class:'card'},
+    el('div',{class:'card-h'}, 'Swapping '+(s.amount||'')+' '+from+' → '+to),
+    el('div',{class:'card-b stack'}, htlcTracker(s), el('div',{class:'sub faint'},'Keep this tab open until it finishes; the swap runs in your browser. It sends two transactions (a deposit, then the swap contract).')));
+  if(s.done){
+    const r = s.done;
+    return el('div',{class:'card'},
+      el('div',{class:'card-h'}, '✓ Swap complete'),
+      el('div',{class:'card-b stack'},
+        swapKv('Sent', fmt8(r.sendSats)+' '+r.fromCoin),
+        swapKv('Received', el('b',{class:'ok'}, swap.fmtBtc(r.recvSats)+' '+r.toCoin)),
+        r.redeemTxid ? swapKv('Receive tx', el('a',{href:swap.explorerTx(r.toCoin, r.redeemTxid),target:'_blank',rel:'noopener',class:'mono'}, String(r.redeemTxid).slice(0,20)+'…')) : null,
+        el('div',{class:'sub faint'}, 'Your '+r.toCoin+' was sent to your wallet. Switch to '+r.toCoin+' to see it.'),
+        el('div',{class:'row',style:'flex:0'}, el('button',{class:'btn',onclick:()=>{ htlcReset(); render(); }}, 'Swap again'))));
+  }
+  const amtIn = el('input',{type:'number',min:'0',step:'0.00000001',value:s.amount,placeholder:'amount '+from});
+  amtIn.addEventListener('input', e=>{ s.amount = e.target.value; s.quote = null; s.err=null; });   // silent (keep focus)
+  const quoteBtn = el('button',{class:'btn ghost'}, s.quoting ? 'Getting rate…' : 'Get rate');
+  quoteBtn.disabled = s.quoting || !(parseFloat(s.amount) > 0);
+  quoteBtn.addEventListener('click', swapHtlcQuote);
+  const swapBtn = el('button',{class:'btn'}, 'Swap');
+  swapBtn.disabled = !s.quote;
+  swapBtn.title = !s.quote ? 'Get a rate first' : '';
+  swapBtn.addEventListener('click', swapHtlcRun);
+  const recv = s.quote && s.quote.recv_sats != null ? swap.fmtBtc(s.quote.recv_sats) : null;
+  const rate = s.quote && s.quote.recv_sats != null && Number(s.quote.send_sats||0)>0 ? (Number(s.quote.recv_sats)/Number(s.quote.send_sats)) : null;
+  const body = el('div',{class:'card-b stack'},
+    renderSwapDirRow(),
+    el('div',{class:'field'}, el('label',{class:'fld'},'You send'), el('div',{class:'row'}, amtIn, el('span',{class:'sub',style:'align-self:center'}, from), el('button',{class:'btn ghost sm',style:'flex:0',onclick:swapHtlcMax}, 'Max')), (s.quote ? makerRangeHint(s.quote.min_sats, s.quote.max_sats, from, swap.fmtBtc) : null)),
+    el('div',{class:'field'}, el('label',{class:'fld'},'You receive'), el('div',{class:'row'}, el('div',{class:'mono',style:'flex:1;min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-sm);padding:.6em .7em;font-size:14px;box-sizing:border-box'}, recv ? '≈ '+recv : '-'), el('span',{class:'sub',style:'align-self:center'}, to))),
+    s.quote ? el('div',{class:'sub'}, 'Rate: 1 '+from+' ≈ '+(rate!=null?rate.toPrecision(4):'?')+' '+to+'  ·  plus on-chain network fees') : null,
+    el('div',{class:'row',style:'flex:0'}, quoteBtn, swapBtn),
+    s.err ? el('div',{class:'msg bad'}, s.err) : null,
+    el('div',{class:'sub faint'}, 'Non-custodial atomic swap over the ', el('a',{href:'https://testnetswap.com',target:'_blank',rel:'noopener'}, 'TestnetSwap'), ' network. Your '+from+' is deposited from this wallet then locked in a contract; the '+to+' is received at your own address. If the other side stalls, you reclaim your '+from+' after the refund timeout. Testnet only.'));
+  return el('div',{class:'card', id:'htlc-card'}, el('div',{class:'card-h'}, 'Swap', el('span',{class:'sub'}, 'non-custodial · testnet')), body);
+}
+
+function renderHtlcRecovery(r){
+  const from = r.from || 'tBTC', to = r.to || htlcCounterTicker(from);
+  const msg = el('div',{class:'msg',style:'display:none'});
+  const show = (k,t)=>{ msg.className='msg '+(k||''); msg.textContent=t; msg.style.display=''; };
+  const funded = r.fundTxid != null, refundReady = !r.t1 || Math.floor(Date.now()/1000) >= r.t1;
+  const reclaimBtn = el('button',{class:'btn'}, 'Reclaim my '+from);
+  reclaimBtn.addEventListener('click', ()=>swapHtlcRecover(reclaimBtn, show));
+  const clearBtn = el('button',{class:'btn ghost sm'}, 'Clear');
+  clearBtn.addEventListener('click', ()=>{ if(confirm('Clear this saved swap? If any '+from+' is still locked in the swap contract you would lose the ability to reclaim it.')){ swap.clearRecovery(); render(); } });
+  const note = funded && !refundReady
+    ? 'Your '+from+' contract refund opens at '+new Date(r.t1*1000).toLocaleString()+'. You can reclaim any deposit funds now; come back after that time to refund the contract.'
+    : 'Reclaim your '+from+' held at the deposit address'+(funded?' and refund your funded contract':'')+'.';
+  return el('div',{class:'card'},
+    el('div',{class:'card-h'}, 'Unfinished '+from+' → '+to+' swap'),
+    el('div',{class:'card-b stack'},
+      (state.swapHt && state.swapHt.err) ? el('div',{class:'msg bad'}, state.swapHt.err) : null,
+      el('p',{class:'sub'}, note),
+      el('div',{class:'row',style:'flex:0'}, reclaimBtn, clearBtn), msg));
+}
+function htlcCounterTicker(t){ return t === 'tBTC' ? 'tLTC' : 'tBTC'; }
+
+/* ---- HTLC handlers ---- */
+async function swapHtlcQuote(){
+  const s = htlcState();
+  s.quoting = true; s.err = null; renderSwapForm();
+  try {
+    const sendSats = Math.round(parseFloat(s.amount) * 1e8);
+    if(!(sendSats > 0)) throw new Error('enter an amount');
+    s.quote = await swap.getHtlcQuote({ fromCoin: htlcFromCoin(), toCoin: htlcToCoin(), sendSats });
+  } catch(e){ s.err = 'Could not get a rate: '+swapNetErr(e)+'.'; s.quote = null; }
+  s.quoting = false; renderSwapForm();
+}
+// Deposit funder injected into swap.runHtlcSwap: build+sign+broadcast an exact-sats send from the
+// user's confirmed balance to the swap fund address, reusing the wallet's own send primitives.
+async function htlcDeposit(fundAddr, sats, feeRate){
+  if(state.watchOnly || !state.master) throw new Error('watch-only wallet cannot spend');
+  if(!isValidAddress(fundAddr, state.coin)) throw new Error('invalid deposit address');
+  const net = COINS[state.coin].net;
+  const cand = (await gatherInputs(state.coin, state.addrType)).filter(c=>c.confirmed);
+  if(!cand.length) throw new Error('no confirmed '+COINS[state.coin].ticker+' to fund the swap');
+  const sel = btc.selectUTXO(cand.map(c=>c.inp), [{ address: fundAddr, amount: BigInt(Math.round(sats)) }], 'default', {
+    changeAddress: state.addresses[0].address, feePerByte: BigInt(Math.max(1, Math.round(feeRate)||1)), dust: BigInt(DUST), network: net, createTx: true,
+  });
+  if(!sel || !sel.tx) throw new Error('not enough confirmed '+COINS[state.coin].ticker+' (need '+fmt8(sats)+' + fee)');
+  const seen = new Set();
+  for(const c of cand){ const kh = bytesToHex(c.key); if(seen.has(kh)) continue; seen.add(kh); try{ sel.tx.sign(c.key); }catch(_){} }
+  sel.tx.finalize();
+  const txid = await broadcast(state.coin, sel.tx.hex);
+  return { txid };
+}
+async function swapHtlcRun(){
+  const s = htlcState();
+  if(!s.quote) return toast('Get a rate first','warn');
+  if(state.watchOnly || !state.master) return toast('This is a watch-only wallet; it cannot fund a swap','warn');
+  // Single recovery slot: never start while another swap is pending or running (would clobber its blob).
+  if(swap.hasRecovery() || (state.swap && state.swap.busy)) return toast('Finish or clear your pending swap first','warn');
+  const fromCoin = htlcFromCoin(), toCoin = htlcToCoin();
+  const sendSats = Math.round(parseFloat(s.amount) * 1e8);
+  if(!(sendSats >= 1000)) return toast('Amount is too small for an on-chain swap','warn');
+  try {
+    await withSwapLock(async ()=>{
+      s.busy = true; s.err = null; s.steps = {}; s.note = 'Preparing the swap…'; render();
+      // Cap the swap fee rate: above ~50 sat/vB the taker's funding-fee headroom would leave orphanable
+      // change at the ephemeral fund key. Testnet fees sit near 1-2 sat/vB, so this only bites a spike.
+      const feeRate = Math.min(40, Math.max(2, Math.round(await getFeeRate(state.coin)) || 2));
+      const res = await swap.runHtlcSwap({
+        fromCoin, toCoin, sendSats, makerId: null,
+        recvAddr: swapReceiveAddr(toCoin), refundAddr: swapReceiveAddr(fromCoin),
+        feeRate, minRecvSats: s.quote && s.quote.recv_sats,
+        deposit: (addr, amt)=> htlcDeposit(addr, amt, feeRate),
+        onStatus: (phase, note, meta)=>{ htlcApplyPhase(s, phase, note, meta); const n = htlcNote(phase, htlcFromCoin(), htlcToCoin()) || note; if(n) s.note = n; render(); },
+      });
+      s.busy = false; s.done = res; render();
+      refresh();   // the deposit spent from this coin's balance
+    });
+  } catch(e){
+    s.busy = false;
+    if(e && e.swapLockBusy){ toast('A swap is already in progress on this wallet (this or another tab); finish it first','warn'); }
+    else s.err = swap.recoveryKind()==='htlc' ? ('Swap interrupted: '+((e&&e.message)||e)+'. Reclaim below.') : ((e&&e.message)||String(e));
+    render();
+  }
+}
+async function swapHtlcRecover(btn, show){
+  const r = swap.getRecovery(); if(!r) return;
+  btn.disabled = true; show('', 'Reclaiming your '+(r.from||'coin')+'…');
+  try {
+    const res = await withSwapLock(()=> swap.recoverHtlcSwap({ recovery: r, destAddress: swapReceiveAddr(r.from), onStatus:(p,n)=>{ if(n) show('', n); } }));
+    const bits = [];
+    if(res.swept) bits.push('swept deposit ('+swap.fmtBtc(res.swept.sats)+' '+r.from+')');
+    // A broadcast refund (res.refunded) is now kept PENDING until it confirms, so distinguish it from a
+    // contract whose T1 has not arrived or whose refund has not landed yet.
+    if(res.refunded) bits.push('refund broadcast: '+String(res.refunded.refundTxid).slice(0,16)+'…; it clears once it confirms - reclaim again shortly');
+    else if(res.refundPending) bits.push('contract refund not confirmed yet; retry after '+(r.t1?new Date(r.t1*1000).toLocaleString():'the timeout')+', or use Clear if a deposit never completed');
+    if(res.depositPending) bits.push('no confirmed deposit yet - your reclaim key is kept; retry shortly, or use Clear if you never completed a deposit');
+    const pending = res.refundPending || res.depositPending;   // keep the card + button live; NEVER report "nothing to reclaim" while value may still be on-chain
+    show(pending?'warn':'ok', bits.length?bits.join('; '):'Nothing left to reclaim.');
+    if(pending) btn.disabled=false; else render();
+  } catch(e){
+    if(e && e.swapLockBusy){ show('warn', 'This swap is already running in another tab; use that tab.'); btn.disabled=false; return; }
+    show('bad', 'Reclaim failed (safe to retry): '+((e&&e.message)||e)); btn.disabled=false;
+  }
+}
+function fmt8(sats){ return (Number(sats)/1e8).toFixed(8).replace(/0+$/,'').replace(/\.$/,''); }
+
 /* ---- tabs ---- */
+function swapTabDot(k){ return (k==='swap' && swap.hasRecovery()) ? el('span',{class:'dot',style:'width:7px;height:7px;margin:0 0 0 5px;background:var(--warn)'}) : null; }   // calm amber cue on the Swap tab when an unfinished swap needs attention
 function renderTabs(){
   if(isMweb()){
     const cur = ['send','history'].includes(state.tab) ? state.tab : 'receive';
@@ -1144,16 +1722,16 @@ function renderTabs(){
   }
   if(COINS[state.coin].addrModel === 'monero'){
     const bar = el('div',{class:'tabbar'});
-    for(const [k,l] of [['receive','Receive'],['send','Send'],['history','History'],['advanced','Tools']]){
-      const t = el('div',{class:'tab'+(k===state.tab?' active':'')}, l);
+    for(const [k,l] of [['receive','Receive'],['send','Send'],['swap','Swap'],['history','History'],['advanced','Tools']].filter(([k])=>k!=='swap'||swapAvailable())){
+      const t = el('div',{class:'tab'+(k===state.tab?' active':'')}, l, swapTabDot(k));
       t.addEventListener('click', ()=>{ state.tab = k; render(); }); bar.append(t);
     }
     return bar;
   }
-  const tabs = [['receive','Receive'],['send','Send'],['history','History'],['advanced','Advanced']];
+  const tabs = [['receive','Receive'],['send','Send'],['swap','Swap'],['history','History'],['advanced','Advanced']].filter(([k])=>k!=='swap'||swapAvailable());
   const bar = el('div',{class:'tabbar'});
   for(const [key,label] of tabs){
-    const t = el('div',{class:'tab'+(key===state.tab?' active':'')}, label);
+    const t = el('div',{class:'tab'+(key===state.tab?' active':'')}, label, swapTabDot(key));
     t.addEventListener('click', ()=>{ state.tab=key; render(); });
     bar.append(t);
   }
@@ -1169,11 +1747,13 @@ function renderPanel(){
     if(state.tab==='send') return renderMoneroSend();
     if(state.tab==='history') return renderMoneroHistory();
     if(state.tab==='advanced') return renderMoneroTools();
+    if(state.tab==='swap') return renderSwap();
     return renderMoneroReceive();
   }
   if(state.tab==='receive') return renderReceive();
   if(state.tab==='history') return renderHistory();
   if(state.tab==='send')  return renderSend();
+  if(state.tab==='swap') return renderSwap();
   if(state.tab==='advanced') return renderAdvanced();
 }
 // Tools + Developer tools live under one "Advanced" tab with a sub-toggle, to keep the main flow clean.
@@ -1372,7 +1952,7 @@ function parseMoneroUri(uri){   // monero:ADDR?tx_amount=1.5&tx_description=...
   const m = String(uri).match(/^monero:([^?]*)(\?(.*))?$/i);
   if(!m) return { address: String(uri).trim(), amount:'' };
   const p = new URLSearchParams(m[3] || '');
-  return { address: decodeURIComponent(m[1]).trim(), amount: p.get('tx_amount') || p.get('amount') || '' };
+  return { address: safeDecodeURI(m[1]).trim(), amount: p.get('tx_amount') || p.get('amount') || '' };
 }
 function renderMoneroSend(){
   const c = COINS[state.coin], sx = state.xmr;
@@ -1793,16 +2373,16 @@ function txActions(t, c){
 /* ----------------------------- coin / type switching ----------------------------- */
 function mwebEnabled(){ return MWEB_ENABLED && state.mwebOk === true; }
 function isMweb(){ return state.coin === 'ltc' && state.ltcMweb === true && mwebEnabled(); }   // MWEB is an address-type within Litecoin, not a separate coin
-function switchCoin(coin){ if(state.watchOnly) return; if(!COINS[coin].enabled||coin===state.coin) return; state.coin=coin; clearMax(); _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); render(); refresh(); }
-function switchType(type){ if(type===state.addrType && !state.ltcMweb) return; state.ltcMweb=false; state.addrType=type; clearMax(); saveSettings(); buildAddresses(); render(); refresh(); }
-function switchToMweb(){ if(isMweb()) return; _cancelRefresh(); state.ltcMweb=true; saveSettings(); buildAddresses(); render(); }   // enter MWEB mode; cancel any in-flight on-chain scan so it cannot clobber shared state
-function switchXmrNet(net){ if(net===state.xmrNet || !xmr.XMR_NETS[net] || state.xmr.syncing) return; state.xmrNet=net; state.xmrAccount=0;
+function switchCoin(coin){ if(state.watchOnly) return; if(!COINS[coin].enabled||coin===state.coin) return; if(swapBusy()){ toast('Finish or reclaim your running swap first','warn'); return; } state.coin=coin; clearMax(); _lastBal=null; _lastPending=new Set(); saveSettings(); buildAddresses(); render(); refresh(); }
+function switchType(type){ if(type===state.addrType && !state.ltcMweb) return; if(swapBusy()){ toast('Finish or reclaim your running swap first','warn'); return; } state.ltcMweb=false; state.addrType=type; clearMax(); saveSettings(); buildAddresses(); render(); refresh(); }
+function switchToMweb(){ if(isMweb()) return; if(swapBusy()){ toast('Finish or reclaim your running swap first','warn'); return; } _cancelRefresh(); state.ltcMweb=true; saveSettings(); buildAddresses(); render(); }   // enter MWEB mode; cancel any in-flight on-chain scan so it cannot clobber shared state
+function switchXmrNet(net){ if(net===state.xmrNet || !xmr.XMR_NETS[net] || state.xmr.syncing) return; if(swapBusy()){ toast('Finish or reclaim your running swap first','warn'); return; } state.xmrNet=net; state.xmrAccount=0;
   state.xmr = { wallet:null, syncing:false, synced:false, pct:0, restoreHeight:0, start:0, height:0, endHeight:0, balance:null, unlocked:null, txs:[], accounts:[], error:null, node:null };   // each net has its own balance + cache; reset so the new net re-syncs (auto-resumes from its own cache)
   saveSettings(); buildAddresses(); render(); }
 
 /* ----------------------------- Monero engine (balance/spend via monero-ts, lazy) ----------------------------- */
 const DEFAULT_XMR_NODE = { testnet:'https://xmr-testnet-node.librenode.com', stagenet:'https://xmr-stagenet-node.librenode.com' };   // HTTPS + permissive CORS + restricted RPC, so they work directly from the browser. Override either in Settings.
-function xmrNodeUrl(){ const o = store.settings && store.settings.xmrNode; return (o && o[state.xmrNet]) || DEFAULT_XMR_NODE[state.xmrNet] || ''; }
+function xmrNodeUrl(net){ net = net || state.xmrNet; const o = store.settings && store.settings.xmrNode; return (o && o[net]) || DEFAULT_XMR_NODE[net] || ''; }   // net defaults to the active network; pass one explicitly to target a specific network (e.g. a recovery blob's)
 function fmtXmr(atomic){ const n = Number(atomic)/1e12; return n.toFixed(12).replace(/\.?0+$/,'') || '0'; }   // piconero -> XMR
 let _xmrT0 = 0, _xmrTick = null;   // sync elapsed-timer anchor + 1s ticker, so the indicator keeps moving through the event-less hash walk
 function fmtDur(s){ return s >= 3600 ? (Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm') : s >= 60 ? (Math.floor(s/60) + 'm ' + (s%60) + 's') : (s + 's'); }
@@ -2754,13 +3334,17 @@ function actWallets(editId){
       const rename = el('button',{class:'btn ghost sm'},'Rename');
       rename.addEventListener('click', ()=>actWallets(w.id));
       const forget = el('button',{class:'btn ghost sm'},'Forget');
-      forget.addEventListener('click', ()=>{ confirmModal('Forget "'+w.name+'"? Make sure you have its recovery phrase saved. This only removes it from this browser.', ()=>{
+      const hasSwap = !!(store.swapRecovery && store.swapRecovery[w.id]);   // a live swap-recovery blob holds the ONLY reclaim key (random, not seed-derived) - forgetting strands it
+      const forgetMsg = 'Forget "'+w.name+'"? Make sure you have its recovery phrase saved. This only removes it from this browser.'
+        + (hasSwap ? ' WARNING: this wallet has an UNFINISHED swap. Its reclaim key is stored only here and is NOT in your recovery phrase - forgetting it will permanently strand any funds still in that swap. Finish or reclaim the swap first.' : '');
+      forget.addEventListener('click', ()=>{ if(hasSwap || (state.wallet && state.wallet.id===w.id && swapBusy())){ toast('Reclaim or clear the unfinished swap on this wallet before forgetting it','warn'); return; } confirmModal(forgetMsg, ()=>{
         store.wallets = (store.wallets||[]).filter(x=>x.id!==w.id);
         if(store.counts) delete store.counts[w.id];
         if(store.txNotes) delete store.txNotes[w.id];
         if(store.xmrLabels) delete store.xmrLabels[w.id];
         if(store.mwebLabels) delete store.mwebLabels[w.id];
         if(store.lastPegin) delete store.lastPegin[w.id];
+        if(store.swapRecovery) delete store.swapRecovery[w.id];
         if(store.settings && store.settings.xmrRestore) delete store.settings.xmrRestore[w.id];
         if(store.settings && store.settings.mwebRestore) delete store.settings.mwebRestore[w.id];
         deleteXmrData(w.id);                                   // purge the wallet's Monero keys+cache too
@@ -2867,7 +3451,7 @@ function parseBip21(uri){
   const m = String(uri).match(/^[a-zA-Z]+:([^?]*)(\?(.*))?$/);
   if(!m) return { address: String(uri) };
   const p = new URLSearchParams(m[3] || '');
-  return { address: decodeURIComponent(m[1]), amount: p.get('amount') || '', label: p.get('label') || '' };
+  return { address: safeDecodeURI(m[1]), amount: p.get('amount') || '', label: p.get('label') || '' };
 }
 // Build the candidate input set across the current coin+type addresses (with the key that signs each).
 async function gatherInputs(coin, type){
@@ -4189,7 +4773,7 @@ function securitySection(){
       el('div',{}, b));
   } else {
     const lock = el('button',{class:'btn ghost'},'Lock now');
-    lock.addEventListener('click', ()=>{ closeModal(); lockWallet(); });
+    lock.addEventListener('click', ()=>{ if(swapBusy()){ toast('Finish or reclaim your running swap before locking','warn'); return; } closeModal(); lockWallet(); });   // a full lock mid-swap wipes the key the swap still needs to persist its reclaim blob
     const change = el('button',{class:'btn ghost'},'Change password');
     change.addEventListener('click', ()=> passwordSetupModal(true));
     const off = el('button',{class:'btn ghost'},'Turn off');
@@ -4313,7 +4897,7 @@ function wireTheme(){
     const next = document.documentElement.getAttribute('data-theme')==='dark' ? 'light' : 'dark';
     applyTheme(next); saveSettings();
   });
-  const lb = $('lock-toggle'); if(lb) lb.addEventListener('click', ()=>{ if(isEncrypted() && !isLocked()){ if(_pin) softLock(); else lockWallet(); } });
+  const lb = $('lock-toggle'); if(lb) lb.addEventListener('click', ()=>{ if(isEncrypted() && !isLocked()){ if(_pin){ softLock(); } else { if(swapBusy()){ toast('Finish or reclaim your running swap before locking','warn'); return; } lockWallet(); } } });   // soft-lock keeps the key (safe mid-swap); only the no-PIN FULL lock is guarded
 }
 /* Lock screen (shown when encryption is on and the wallet isn't unlocked yet). */
 function renderLockScreen(){
@@ -4353,7 +4937,7 @@ function renderPinScreen(){
     el('div',{class:'card-b stack'},
       el('div',{class:'sub'},'Enter your PIN to unlock. A full reload or 15 minutes idle will need your password instead.'),
       el('div',{class:'field'}, el('label',{class:'fld'},'PIN'), pin),
-      el('div',{class:'row',style:'flex:0'}, btn, el('button',{class:'btn ghost',onclick:lockWallet},'Use password instead')), out));
+      el('div',{class:'row',style:'flex:0'}, btn, el('button',{class:'btn ghost',onclick:()=>{ if(swapBusy()){ toast('Finish or reclaim your running swap before locking','warn'); return; } lockWallet(); }},'Use password instead')), out));   // the 4th full-lock entry point (PIN screen); guard it like the others so no full lock fires mid-swap
 }
 /* Set/change the session PIN (in-memory only). */
 function pinSetupModal(){
@@ -4379,7 +4963,7 @@ function wireAutoLock(){
   const bump = ()=>{ _lastActivity = Date.now(); };
   ['click','keydown','touchstart','mousemove','wheel'].forEach(ev => document.addEventListener(ev, bump, { passive:true }));
   bump();
-  setInterval(()=>{ if(isEncrypted() && _cryptoKey && _lastActivity && (Date.now() - _lastActivity) > IDLE_LOCK_MS) lockWallet(); }, 30000);   // FULL-lock on idle (fires while unlocked OR soft-locked, since both hold the key); also clears a revealed seed/WIF
+  setInterval(()=>{ if(isEncrypted() && _cryptoKey && _lastActivity && (Date.now() - _lastActivity) > IDLE_LOCK_MS){ if((state.swap && state.swap.busy) || (state.swapHt && state.swapHt.busy)) return; lockWallet(); } }, 30000);   // FULL-lock on idle (fires while unlocked OR soft-locked, since both hold the key); also clears a revealed seed/WIF. NEVER auto-lock mid-swap: a lock mid-flight would wipe the key while the running swap still needs to persist its reclaim blob (fund-loss).
 }
 /* Apply settings + open the active wallet once the store is available (plaintext boot OR after unlock). */
 function afterStoreLoaded(){
@@ -4411,7 +4995,7 @@ function handleDeepLink(){
     const params = new URLSearchParams(location.search || '');
     action = params.get('action') || '';
     raw = (params.get('send') || params.get('bip21') || params.get('uri') || '').trim();
-    if(!raw && location.hash){ const h = decodeURIComponent(location.hash.slice(1)); if(/^(bitcoin|litecoin|monero):/i.test(h)) raw = h.trim(); }
+    if(!raw && location.hash){ const h = safeDecodeURI(location.hash.slice(1)); if(/^(bitcoin|litecoin|monero):/i.test(h)) raw = h.trim(); }
   } catch(_){ return; }
   const cleanUrl = ()=>{ try { history.replaceState(null, '', location.pathname); } catch(_){} };
   if(!raw && !action) return;                                  // nothing to route
@@ -4465,6 +5049,48 @@ function boot(){
     if(!msr.ok) console.warn('Multisig self-test failed; multisig disabled:', msr.fails);
   } catch(e){ _msigOk = false; console.warn('Multisig self-test error:', e); }
   wireTheme();
+  // Swap recovery is a per-wallet single slot in the vault; the closures read `store`/`state.wallet` lazily.
+  swap.configureStore({
+    get: ()=> (state.wallet && store.swapRecovery) ? (store.swapRecovery[state.wallet.id] || null) : null,
+    // Genuinely fail-closed: REJECT (never silently resolve) when the slot cannot be durably written, so an
+    // awaited onBeforeLock/onAfterFund aborts the swap BEFORE it locks/funds. A silent no-op here (locked
+    // vault -> saveStoreNow returns without writing; or no active wallet) would fund with no reclaim blob.
+    set: (r)=>{ if(!state.wallet) return Promise.reject(new Error('cannot persist swap recovery: no active wallet')); if(_encOn && !_cryptoKey) return Promise.reject(new Error('cannot persist swap recovery: the wallet vault is locked')); store.swapRecovery = store.swapRecovery || {}; store.swapRecovery[state.wallet.id] = r; render(); return saveStoreAwait(); },
+    clear: ()=>{ if(store.swapRecovery && state.wallet){ delete store.swapRecovery[state.wallet.id]; render(); return saveStoreAwait(); } return Promise.resolve(); },
+  });
+  // Cross-tab single-slot safety: another tab that blind-overwrites the shared store would otherwise
+  // clobber a swap-recovery blob a tab just saved. On every foreign write, re-hydrate our in-memory
+  // swapRecovery by a per-wallet UNION that keeps the NEWER blob (by `at`), so no LIVE reclaim key is
+  // ever dropped by the next whole-store save. (A cleared blob may briefly reappear in the other tab -
+  // harmless; recovery self-heals to empty on the next Reclaim.)
+  async function reloadSwapRecoveryFromDisk(){
+    try {
+      const raw = localStorage.getItem(LS_KEY); if(!raw) return;
+      const parsed = JSON.parse(raw); let disk = null;
+      if(parsed && parsed.tnwvault){ if(!_cryptoKey) return; disk = JSON.parse(await decWith(_cryptoKey, parsed.iv, parsed.ct)); }
+      else disk = parsed;
+      if(_locked || (_encOn && !_cryptoKey)) return;   // a FULL lock landed during the async decrypt: never repopulate the just-wiped store with decrypted key material
+      if(!disk) return;
+      const diskSR = disk.swapRecovery || {};          // a foreign whole-store write may have DROPPED the slot entirely; treat as empty and STILL re-persist our survivor (do not bail)
+      // Rank recovery richness so a merge NEVER downgrades a full reclaim blob (funded HTLC / locked XMR) to a
+      // pre-deposit stub. Within equal rank prefer a STRICTLY newer `at` (`>`, not `>=`: `at` is whole-seconds,
+      // so `>=` could let an equal-second stale copy replace a live one).
+      const rank = (b)=> !b ? -1 : (b.fundTxid != null || b.lockOutpoint) ? 2 : (b.kind ? 1 : 0);
+      const merged = Object.assign({}, store.swapRecovery || {}); let ramChanged = false;
+      for(const wid of Object.keys(diskSR)){
+        const d = diskSR[wid], cur = merged[wid];
+        const take = !cur || rank(d) > rank(cur) || (rank(d) === rank(cur) && (d.at||0) > (cur.at||0));
+        if(take && JSON.stringify(cur) !== JSON.stringify(d)){ merged[wid] = d; ramChanged = true; }
+      }
+      if(ramChanged){ store.swapRecovery = merged; try { render(); } catch(_){} }
+      // Re-persist iff DISK is stale vs the merged truth. Gating on `ramChanged` alone MISSED the canonical
+      // clobber (a foreign write DROPPED our blob from disk while RAM still holds it): the disk loop never
+      // visits an absent wid, so the survivor stayed RAM-only. Comparing to disk catches that. Convergent:
+      // once disk == merged the strings match and no further write fires (no cross-tab save storm).
+      if(JSON.stringify(diskSR) !== JSON.stringify(merged)) saveStore();
+    } catch(_){}
+  }
+  window.addEventListener('storage', (e)=>{ if(e.key === LS_KEY && !_locked) reloadSwapRecoveryFromDisk(); });
   let parsed = null; try { const raw = localStorage.getItem(LS_KEY); parsed = raw ? JSON.parse(raw) : null; } catch(_){}
   if(parsed && parsed.tnwvault){                          // encrypted on disk -> gate behind the unlock screen
     _encOn = true; _locked = true; _vaultIter = parsed.iter || KDF_ITER;
