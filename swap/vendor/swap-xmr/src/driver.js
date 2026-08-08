@@ -152,7 +152,7 @@ export async function bobSwap({ x, btc, transport, chains, km, params }) {
  * recovers s_a and sweeps the XMR (the winning outcome) instead of refunding.
  * Requires `unwind.redeemAdaptor` (set once Bob released it) to recover from redeem.
  */
-export async function bobUnwind({ x, btc, chains, km, unwind, xmrRestoreHeight = 0, xmrSweepDest }) {
+export async function bobUnwind({ x, btc, chains, km, unwind, xmrRestoreHeight = 0, xmrSweepDest, refundConfTries = 40, refundConfPollMs = 15000 }) {
   // Try to claim from a redeem that may already be (or become) on-chain.
   const tryRedeem = async () => {
     if (!unwind.redeemAdaptor || !chains.btc.getSpend) return null;
@@ -181,7 +181,20 @@ export async function bobUnwind({ x, btc, chains, km, unwind, xmrRestoreHeight =
   //    in swap.js). Only then reveal m_b via refund so Alice can reclaim.
   const late = await tryRedeem(); if (late) return late;
   const fin = as.bobFinalizeRefund(x, btc, { tx: unwind.refundTx, ctx: unwind.ctx, bobBtcKey: km.btcKey, bobMSpend: km.mSpend, refundSighash: unwind.refundSighash, aliceRefundAdaptor: unwind.refundAdaptor, aliceBtcPub: unwind.alice.btcPub, bobPb: as.publicBundle(x, km).P });
-  return { state: 'refunded', refundTxid: await chains.btc.broadcast(fin.hex) };
+  const refundTxid = await chains.btc.broadcast(fin.hex);   // reveals m_b, returns Bob's BTC; the sighash is fixed, so this CANNOT be RBF'd
+  // KEEP-ALIVE (P1b): monitor the refund to confirmation instead of declaring success on broadcast. A caller
+  // that forgets the durable record on a mere broadcast would strand Bob if the refund is evicted or never
+  // confirms (no RBF to rescue it). While waiting, keep re-checking for a late redeem (still strictly better
+  // for Bob). No confirmation-depth source (mock/tests) -> treat as settled. If it hasn't confirmed within the
+  // budget, return 'refund_pending' so the caller KEEPS the record and resume() re-attempts (future: CPFP).
+  let confirmed = !chains.btc.txConfs;
+  for (let i = 0; !confirmed && i < refundConfTries; i++) {
+    const r = await tryRedeem(); if (r) return r;
+    let c = 0; try { c = await chains.btc.txConfs(refundTxid); } catch {}
+    if (c >= 1) { confirmed = true; break; }
+    await sleep(refundConfPollMs);
+  }
+  return { state: confirmed ? 'refunded' : 'refund_pending', refundTxid, confirmed };
 }
 
 /**

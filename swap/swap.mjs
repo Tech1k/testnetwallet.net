@@ -22,7 +22,7 @@ import { loadXmrCrypto } from './vendor/swap-xmr/src/crypto.js';
 import { esploraChain } from './vendor/swap-taker/esplora.js';
 import { connectRelay } from './vendor/swap-taker/relay.js';
 import { runXmrTaker, runXmrResume, requestXmrQuote, reclaimXmr,
-         runHtlcTaker, refundHtlc, genHtlcKeys, htlcFundingAddress } from './vendor/swap-taker/taker.js';
+         runHtlcTaker, refundHtlc, redeemHtlc, genHtlcKeys, htlcFundingAddress } from './vendor/swap-taker/taker.js';
 import * as moneroEngine from '../monero-engine.mjs';
 
 /* ---- config (override via window globals for local dev) ---- */
@@ -161,7 +161,7 @@ export async function runXmrSwap({
     const params = {
       fromCoin, toCoin,                                   // coin tickers -> the driver emits coin-correct status notes (no hardcoded tBTC/tXMR)
       sendCoinNetwork: settleNet(toCoin), moneroNetwork: net,
-      t1Blocks: q.t1_blocks, t2Blocks: q.t2_blocks, lockAmount: q.lock_sats, minConf: settleConf(toCoin),
+      t1Blocks: q.t1_blocks, t2Blocks: q.t2_blocks, lockAmount: q.lock_sats, minConf: settleConf(toCoin), minRevealConf: settleConf(toCoin),   // make the reorg-safe REVEAL floor explicit (it already resolves to this via withTimeouts' minConf default, but pin it so a later minConf change can't silently lower it); matches finishXmrSwap + the site
       xmrAmount: q.xmr_pico != null ? Number(q.xmr_pico) : wantPico,
       xmrRestoreHeight: restoreHeight, xmrSweepDest: xmrRefundAddr, aliceBtcDest: btcReceiveAddr,
       setupTimeoutMs: 60000, lockTimeoutMs: 3_600_000, redeemTimeoutMs: 3_600_000, onStatus,
@@ -325,6 +325,9 @@ export async function runHtlcSwap({
         // Upgrade the reclaim blob to the full HTLC recovery the instant the contract funds (awaited,
         // pre-broadcast). Keep fundPrivHex so residual/notFunded value stays sweepable via recoverHtlcSwap.
         onAfterFund: async (recovery) => { await saveRecovery({ ...recovery, ...fundKeyBlob, makerId, at: nowSec() }); },
+        // P1c: at the reveal, upgrade to the REDEEM-CAPABLE blob so a reload can rebuild + rebroadcast the redeem
+        // (redeemHtlc) instead of the now-unsafe T1 refund. Superset of the refund blob; `revealed` marks it.
+        onBeforeReveal: async (rr) => { await saveRecovery({ ...rr, ...fundKeyBlob, makerId, at: nowSec() }); },
         onStatus,
       },
     });
@@ -349,12 +352,26 @@ export async function recoverHtlcSwap({ recovery, destAddress, feeRate = 2, onSt
   const from = recovery.from, to = recovery.to || htlcCounterCoin(from);
   if (!destAddress) throw new Error('missing a ' + from + ' destination address');
   const chains = htlcChains(from, to);
-  const out = { swept: null, refunded: null, refundPending: false, depositPending: false };
+  const out = { swept: null, refunded: null, redeemed: null, refundPending: false, redeemPending: false, depositPending: false };
 
   // 1) Sweep anything sitting at the ephemeral fund address (an unfunded deposit, a notFunded
   //    leftover, or funding change). Always safe, available immediately.
   try { out.swept = await sweepHtlcFundKey({ fundPrivHex: recovery.fundPrivHex, from, dest: destAddress, feeRate, chains }); }
   catch (e) { /* nothing to sweep, or already swept - fall through to the contract refund */ }
+
+  // P1c: a REVEALED swap (the secret is already public) must NEVER refund at T1 - that races the maker's claim
+  // with a public secret. Re-drive the redeem to confirmation instead (rebuilt deterministically from the blob),
+  // and keep the recovery until it CONFIRMS (never drop the redeem-capable blob on a mere broadcast).
+  if (recovery.revealed && recovery.makerLockTxid != null) {
+    try {
+      out.redeemed = await redeemHtlc({ sc, chains, recovery, feeRate, onStatus });
+      const done = !!(out.redeemed && out.redeemed.confirmed);
+      out.redeemPending = !done; out.refundPending = !done;   // alias refundPending so the existing UI keeps the card live until confirmed
+      if (done) clearRecovery();
+      else onStatus('redeeming', 'your ' + to + ' redeem is broadcast; it confirms on its own - reclaim again shortly if it has not', { coin: to, txid: out.redeemed && out.redeemed.redeemTxid });
+    } catch (e) { out.redeemPending = true; out.refundPending = true; onStatus('redeeming', 'could not finish receiving yet (safe to retry): ' + ((e && e.message) || e)); }
+    return out;
+  }
 
   // 2) If a contract was actually funded, refund it after T1 (the bulk of the value lives here).
   if (recovery.fundTxid != null && recovery.fundVout != null) {

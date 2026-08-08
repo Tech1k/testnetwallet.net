@@ -55,7 +55,7 @@ export function htlcFundingAddress(sc, km, fromCoin) {
  * persist it and later call refundHtlc() at T1.
  */
 export async function runHtlcTaker({ sc, transport, chains, km, params }) {
-  const { from, to, sendSats, minConf = 2, feeRate = 2, recvAddr, minRecvSats = null, onAfterFund, onStatus = () => {}, setupTimeoutMs = 60000, lockTimeoutMs = 3_600_000,
+  const { from, to, sendSats, minConf = 2, feeRate = 2, recvAddr, minRecvSats = null, onAfterFund, onBeforeReveal, onStatus = () => {}, setupTimeoutMs = 60000, lockTimeoutMs = 3_600_000,
     revealMinMarginSecs = 2 * 3600, redeemFeeBumpStep = 6, redeemMaxFeeRate = 40, redeemBumps = 7, redeemPollMs = 60000, redeemPollTries = 10 } = params;
   // Safety coupling (assert, don't assume): the redeem RBF ladder must finish INSIDE the reveal margin, or a
   // slow redeem could still be unconfirmed when the maker can refund its lock at T2 and claim our T1 contract
@@ -74,6 +74,7 @@ export async function runHtlcTaker({ sc, transport, chains, km, params }) {
 
   transport.send(sc.buildMessage.initiate({ quoteId: quote.quote_id, from, to, sendSats, secretHash: hx(km.secretHash), takerRecvPubkey: hx(km.recvPub), takerRefundPubkey: hx(km.refundPub) }));
   const accept = await transport.recv('accept', setupTimeoutMs);
+  { const v = sc.validateMessage(accept); if (!v.ok) throw new Error('invalid accept from maker: ' + v.reason); }   // P5: schema-validate the maker's message (defense-in-depth), like the maker validates the taker's, BEFORE building contracts from it
   const chk = sc.checkAcceptAgainstQuote(quote, accept, now());
   if (!chk.ok) throw new Error('accept check failed: ' + chk.reason);
   // M-1: enforce the rate the user agreed to; abort BEFORE locking if the maker's
@@ -122,6 +123,7 @@ export async function runHtlcTaker({ sc, transport, chains, km, params }) {
     const revealDeadline = accept.t2 - revealMinMarginSecs;
     const budgetMs = Math.max(60_000, (revealDeadline - now()) * 1000);
     const makerLocked = await transport.recv('maker_locked', lockTimeoutMs <= 300_000 ? lockTimeoutMs : budgetMs);
+    { const v = sc.validateMessage(makerLocked); if (!v.ok) throw new Error('invalid maker_locked from maker: ' + v.reason); }   // P5: schema-validate before deriving the redeem from it
     onStatus('maker_locked', 'the maker locked ' + to, { txid: makerLocked.fund_txid, coin: to, contract_addr: makerLocked.contract_addr });
     const makerC = sc.makerContractParams({ secretHash: km.secretHash, takerRecvPubkey: km.recvPub, makerRefundPubkey: sc.hexToBytes(accept.maker_refund_pubkey), t2: accept.t2, recvCoin: to });
     const vm = sc.verifyMakerContract({ witnessScript: makerC.witnessScript, fundedAddress: makerLocked.contract_addr, secretHash: km.secretHash, takerRecvPubkey: km.recvPub, makerRefundPubkey: sc.hexToBytes(accept.maker_refund_pubkey), t1: accept.t1, t2: accept.t2, nowSec: now(), recvCoin: to });
@@ -154,7 +156,28 @@ export async function runHtlcTaker({ sc, transport, chains, km, params }) {
     const redeemUtxo = { txid: makerLocked.fund_txid, vout: makerLocked.vout, amount: mout.value };
     const mkRedeem = (r) => sc.buildRedeemTx({ contract: makerC, utxo: redeemUtxo, secret: km.secret, privkey: km.recvPriv, destAddress: dest, feeRate: r, network: recvNet });
     let rate = feeRate, redeem = mkRedeem(rate);
-    let redeemTxid = await chains[to].broadcast(redeem.hex);
+    // P1c: persist a REDEEM-CAPABLE recovery blob BEFORE revealing, so a page reload after the reveal can
+    // rebuild the maker contract + redeem and rebroadcast to confirmation via redeemHtlc, instead of being stuck
+    // showing "keep the tab open". It is a SUPERSET of the T1-refund blob (refundHtlc still works from it); the
+    // `revealed:true` flag tells the host to REDEEM, not refund, on reload. Fail-closed: an awaited persist that
+    // throws aborts BEFORE the reveal. secretHex/recvPrivHex become public in the redeem tx anyway, so carrying
+    // them adds no exposure beyond km (already in the host's store).
+    const redeemRecovery = { ...recovery, revealed: true, makerRefundPubkey: accept.maker_refund_pubkey, t2: accept.t2, makerLockTxid: makerLocked.fund_txid, makerLockVout: makerLocked.vout, recvSats: accept.recv_sats, recvPrivHex: hx(km.recvPriv), secretHex: hx(km.secret), dest };
+    if (onBeforeReveal) await onBeforeReveal(redeemRecovery);
+    let redeemTxid;
+    try { redeemTxid = await chains[to].broadcast(redeem.hex); }
+    catch (be) {
+      // The redeem reveals S. A broadcast that THREW may still have propagated (flaky esplora). If it did, the
+      // secret is public and the T1 refund is now UNSAFE (the maker can claim our T1 contract with S). Reconcile
+      // on-chain (mirrors the funding-broadcast check): if our redeem output is visible, or the maker lock is
+      // already spent, treat the secret as revealed and continue to the confirm/monitor loop; only re-throw to
+      // the refund path if nothing actually landed (secret not exposed, T1 refund still safe).
+      let propagated = false;
+      try { const o = await chains[to].getOutput(redeem.txid, 0); if (o) propagated = true; } catch {}
+      if (!propagated) { try { const sp = await chains[to].getSpend(makerLocked.fund_txid, makerLocked.vout); if (sp && sp.spent) propagated = true; } catch {} }
+      if (!propagated) { if (onBeforeReveal) { try { await onBeforeReveal(recovery); } catch {} } throw be; }   // truly did not land: revert to the non-revealed blob so the host does the safe T1 refund, then fall through
+      redeemTxid = redeem.txid;    // it propagated; adopt the txid and monitor to confirmation, never misfile as a refund
+    }
     // RBF the redeem toward redeemMaxFeeRate if it is slow to confirm, so a low-fee tx does not sit for
     // hours behind higher-fee ones on a congested testnet4. Bumps are deliberately spaced by a full inner
     // poll window ((redeemPollTries-1)*redeemPollMs, ~9 min) TUNED to testnet4's ~10-min block target: a
@@ -200,7 +223,7 @@ export async function runHtlcTaker({ sc, transport, chains, km, params }) {
     }
     if (confirmed) onStatus('done', 'received ' + to, { txid: redeemTxid, coin: to });
     else onStatus('redeeming', 'your ' + to + ' redeem is broadcast but not yet confirmed; keep this tab open until it confirms', { coin: to, txid: redeemTxid });
-    return { state: 'redeemed', redeemTxid, recvAddr: dest, recvSats: redeem.outAmount, confirmed, recovery: confirmed ? null : recovery };
+    return { state: 'redeemed', redeemTxid, recvAddr: dest, recvSats: redeem.outAmount, confirmed, recovery: confirmed ? null : redeemRecovery };
   } catch (e) {
     e.recovery = recovery; // taker funded but swap stalled; refundable at T1
     throw e;
@@ -228,6 +251,54 @@ export async function refundHtlc({ sc, chains, recovery, destAddress, feeRate = 
   const txid = await chains[recovery.from].broadcast(refund.hex);
   onStatus('done', 'refunded');
   return { state: 'refunded', refundTxid: txid };
+}
+
+/**
+ * P1c: re-drive a REVEALED-but-unconfirmed HTLC redeem from the redeem-capable recovery blob (the one
+ * runHtlcTaker persists via onBeforeReveal). The secret is already public, so the T1 refund is UNSAFE; the only
+ * safe action is to keep the redeem alive until it confirms. Deterministically rebuilds the maker contract +
+ * redeem tx from the blob and rebroadcasts with the fee ladder until it confirms or T2 is near. Idempotent and
+ * safe to retry. If the maker lock output is already gone, it reports (does not throw) so the host can tell the
+ * user to check their balance rather than losing the recovery.
+ */
+export async function redeemHtlc({ sc, chains, recovery, feeRate = 2, redeemFeeBumpStep = 6, redeemMaxFeeRate = 40, redeemBumps = 7, redeemPollMs = 60000, redeemPollTries = 10, onStatus = () => {} }) {
+  const now = () => Math.floor(Date.now() / 1000);
+  if (!recovery || !recovery.revealed || recovery.secretHex == null || recovery.makerLockTxid == null || recovery.makerRefundPubkey == null)
+    throw new Error('recovery blob is not redeem-capable (nothing revealed to re-drive)');
+  const to = recovery.to, recvNet = sc.getCoin(to).network;
+  const secret = sc.hexToBytes(recovery.secretHex);
+  const recvPriv = sc.hexToBytes(recovery.recvPrivHex);
+  const recvPub = sc.getPublicKey(recvPriv);
+  const dest = recovery.dest || recovery.fundAddr;
+  const makerC = sc.makerContractParams({ secretHash: sc.hexToBytes(recovery.secretHash), takerRecvPubkey: recvPub, makerRefundPubkey: sc.hexToBytes(recovery.makerRefundPubkey), t2: recovery.t2, recvCoin: to });
+  const mout = await chains[to].getOutput(recovery.makerLockTxid, recovery.makerLockVout);
+  if (!mout) {
+    // The maker lock output is gone: our redeem most likely confirmed and was swept, OR the maker refunded it
+    // at T2. We can't cheaply tell which, so report honestly and KEEP the recovery (never claim success we
+    // can't prove, never drop the blob while value might still be reachable). The user verifies via balance.
+    let sp = null; try { sp = await chains[to].getSpend(recovery.makerLockTxid, recovery.makerLockVout); } catch {}
+    onStatus('redeeming', 'the maker ' + to + ' lock is already spent; check your ' + to + ' balance', { coin: to, txid: sp && sp.txid });
+    return { state: 'redeemed', confirmed: false, redeemTxid: (sp && sp.txid) || null, recvAddr: dest, recovery, gone: true };
+  }
+  const redeemUtxo = { txid: recovery.makerLockTxid, vout: recovery.makerLockVout, amount: mout.value };
+  const mkRedeem = (r) => sc.buildRedeemTx({ contract: makerC, utxo: redeemUtxo, secret, privkey: recvPriv, destAddress: dest, feeRate: r, network: recvNet });
+  let rate = feeRate, redeem = mkRedeem(rate), redeemTxid;
+  try { redeemTxid = await chains[to].broadcast(redeem.hex); } catch { redeemTxid = redeem.txid; }   // may already be in the mempool from a prior run: adopt the deterministic txid and monitor
+  let confirmed = false;
+  for (let bump = 0; ; bump++) {
+    for (let i = 0; i < redeemPollTries; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, redeemPollMs));
+      onStatus('redeeming', 'your ' + to + ' redeem is broadcast (' + rate + ' sat/vB), waiting for it to confirm', { coin: to, txid: redeemTxid });
+      try { const o = await chains[to].getOutput(redeemTxid, 0); if (o && o.confirmed) { confirmed = true; break; } } catch {}
+    }
+    if (confirmed || bump >= redeemBumps || rate >= redeemMaxFeeRate || (recovery.t2 && now() > recovery.t2)) break;
+    const next = Math.min(rate + redeemFeeBumpStep, redeemMaxFeeRate);
+    if (next <= rate) break;
+    try { const b = mkRedeem(next); redeemTxid = await chains[to].broadcast(b.hex); rate = next; redeem = b; } catch { break; }
+  }
+  if (confirmed) onStatus('done', 'received ' + to, { txid: redeemTxid, coin: to });
+  else onStatus('redeeming', 'your ' + to + ' redeem is broadcast but not yet confirmed; try again shortly', { coin: to, txid: redeemTxid });
+  return { state: 'redeemed', redeemTxid, recvAddr: dest, recvSats: redeem.outAmount, confirmed, recovery: confirmed ? null : recovery };
 }
 
 /* ------------------------------------------------------------ XMR (tXMR -> tBTC) */

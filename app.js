@@ -1693,12 +1693,19 @@ async function swapHtlcRecover(btn, show){
     const res = await withSwapLock(()=> swap.recoverHtlcSwap({ recovery: r, destAddress: swapReceiveAddr(r.from), onStatus:(p,n)=>{ if(n) show('', n); } }));
     const bits = [];
     if(res.swept) bits.push('swept deposit ('+swap.fmtBtc(res.swept.sats)+' '+r.from+')');
-    // A broadcast refund (res.refunded) is now kept PENDING until it confirms, so distinguish it from a
-    // contract whose T1 has not arrived or whose refund has not landed yet.
-    if(res.refunded) bits.push('refund broadcast: '+String(res.refunded.refundTxid).slice(0,16)+'…; it clears once it confirms - reclaim again shortly');
-    else if(res.refundPending) bits.push('contract refund not confirmed yet; retry after '+(r.t1?new Date(r.t1*1000).toLocaleString():'the timeout')+', or use Clear if a deposit never completed');
+    // P1c: a REVEALED swap (secret already public) is re-driven as a REDEEM, not a refund - the T1 refund is unsafe
+    // once the secret is out. Show it as "receive", and keep the card live until the redeem CONFIRMS.
+    if(res.redeemed || res.redeemPending){
+      if(res.redeemed && res.redeemed.confirmed) bits.push('received your '+r.to+' ('+String((res.redeemed && res.redeemed.redeemTxid) || '').slice(0,16)+'…)');
+      else bits.push('your '+r.to+' redeem is broadcast, waiting to confirm - reclaim again shortly to finish');
+    } else {
+      // A broadcast refund (res.refunded) is kept PENDING until it confirms, distinct from a contract whose T1
+      // has not arrived or whose refund has not landed yet.
+      if(res.refunded) bits.push('refund broadcast: '+String(res.refunded.refundTxid).slice(0,16)+'…; it clears once it confirms - reclaim again shortly');
+      else if(res.refundPending) bits.push('contract refund not confirmed yet; retry after '+(r.t1?new Date(r.t1*1000).toLocaleString():'the timeout')+', or use Clear if a deposit never completed');
+    }
     if(res.depositPending) bits.push('no confirmed deposit yet - your reclaim key is kept; retry shortly, or use Clear if you never completed a deposit');
-    const pending = res.refundPending || res.depositPending;   // keep the card + button live; NEVER report "nothing to reclaim" while value may still be on-chain
+    const pending = res.refundPending || res.redeemPending || res.depositPending;   // keep the card + button live; NEVER report "nothing to reclaim" while value may still be on-chain
     show(pending?'warn':'ok', bits.length?bits.join('; '):'Nothing left to reclaim.');
     if(pending) btn.disabled=false; else render();
   } catch(e){
